@@ -25,6 +25,12 @@ hermes-agent full tool access requires:
     pip install -e integrations/hermes-agent
 Without it the bot silently falls back to single-shot TaskRouter completions.
 
+Provider resolution uses hermes-agent's own system (~/.hermes/config.yaml):
+    • `hermes login`                 → free Nous Research Hermes models via OAuth2
+    • custom_providers in config.yaml → any local endpoint (Ollama, vLLM, llama.cpp)
+    • HERMES_INFERENCE_PROVIDER env  → override provider at runtime
+    Falls back to NOUS_API_KEY / OPENROUTER_API_KEY env vars, then Ollama /v1.
+
 Optional env overrides:
     DISCORD_REQUIRE_MENTION         — "true" to only respond when @mentioned
     DISCORD_FREE_RESPONSE_CHANNELS  — comma-separated channel IDs (no mention needed)
@@ -310,15 +316,16 @@ class DiscordGateway:
 
         @tree.command(name="status", description="Show MYCONEX node and gateway status")
         async def slash_status(interaction: discord.Interaction) -> None:
-            base_url, _, model = self._resolve_runtime()
+            base_url, _, model, api_mode = self._resolve_runtime()
+            provider_source = self._resolve_runtime_source()
             flash = _HERMES_DIR.parent / "flash-moe" / "metal_infer" / "infer"
             lines = [
                 "**MYCONEX Status**",
                 f"• hermes-agent: {'✅ loaded — full tools active' if _AIAGENT_AVAILABLE else '⚠️ not loaded — single-shot fallback'}",
                 f"• model: `{model}`",
                 f"• endpoint: `{base_url}`",
-                f"• Nous API key: {'✅' if os.getenv('NOUS_API_KEY') else '❌ not set'}",
-                f"• OpenRouter key: {'✅' if os.getenv('OPENROUTER_API_KEY') else '❌ not set'}",
+                f"• api_mode: `{api_mode}`",
+                f"• provider source: `{provider_source}`",
                 f"• flash-moe binary: {'✅ compiled' if flash.exists() else '⚫ not compiled (macOS only)'}",
                 f"• active sessions: {len(self._states)}",
             ]
@@ -361,7 +368,8 @@ class DiscordGateway:
 
         @tree.command(name="model", description="Show the active LLM model and provider config")
         async def slash_model(interaction: discord.Interaction) -> None:
-            base_url, _, model = self._resolve_runtime()
+            base_url, _, model, api_mode = self._resolve_runtime()
+            provider_source = self._resolve_runtime_source()
             ollama_url = self._config.get("ollama", {}).get("url", "http://localhost:11434")
             fallback_model = (
                 self._config.get("hermes_moe", {})
@@ -371,11 +379,17 @@ class DiscordGateway:
             lines = [
                 "**Model Configuration**",
                 f"• active: `{model}` → `{base_url}`",
+                f"• api_mode: `{api_mode}`",
+                f"• resolved via: `{provider_source}`",
                 "",
-                "**Provider Priority**",
-                f"1. Nous Research `Hermes-3-Llama-3.1-70B` — {'✅' if os.getenv('NOUS_API_KEY') else '❌ NOUS_API_KEY not set'}",
-                f"2. OpenRouter `nousresearch/hermes-3-llama-3.1-70b` — {'✅' if os.getenv('OPENROUTER_API_KEY') else '❌ OPENROUTER_API_KEY not set'}",
-                f"3. Ollama `{fallback_model}` at `{ollama_url}/v1` — always available",
+                "**Provider Resolution Order**",
+                "1. `~/.hermes/config.yaml` (hermes login / custom_providers)",
+                f"2. Nous Research API key env — {'✅' if os.getenv('NOUS_API_KEY') else '❌ NOUS_API_KEY not set'}",
+                f"3. OpenRouter API key env — {'✅' if os.getenv('OPENROUTER_API_KEY') else '❌ OPENROUTER_API_KEY not set'}",
+                f"4. Ollama `{fallback_model}` at `{ollama_url}/v1` — always available",
+                "",
+                "_Run `hermes login` to authenticate with Nous Research (free Hermes access)._",
+                "_Add custom local endpoints via `custom_providers` in `~/.hermes/config.yaml`._",
             ]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -627,11 +641,12 @@ class DiscordGateway:
         recreating the agent.
         """
         if key not in self._agents:
-            base_url, api_key, model = self._resolve_runtime()
+            base_url, api_key, model, api_mode = self._resolve_runtime()
             self._agents[key] = AIAgent(  # type: ignore[call-arg]
                 base_url=base_url,
                 api_key=api_key,
                 model=model,
+                api_mode=api_mode,
                 platform="discord",
                 quiet_mode=True,
                 skip_context_files=True,
@@ -640,7 +655,7 @@ class DiscordGateway:
                     lambda tn, ap: state.tool_cb(tn, ap) if state.tool_cb else None
                 ),
             )
-            logger.debug("[discord] new AIAgent for %s (model=%s)", key, model)
+            logger.debug("[discord] new AIAgent for %s (model=%s api_mode=%s)", key, model, api_mode)
         return self._agents[key]
 
     def _reset_channel(self, key: str) -> None:
@@ -651,34 +666,104 @@ class DiscordGateway:
 
     # ── Provider Resolution ───────────────────────────────────────────────────
 
-    def _resolve_runtime(self) -> tuple[str, str, str]:
+    def _resolve_runtime(self) -> tuple[str, str, str, str]:
         """
-        Return (base_url, api_key, model) for AIAgent.
+        Return (base_url, api_key, model, api_mode) for AIAgent construction.
 
-        Priority: Nous Research API → OpenRouter → Ollama /v1.
-        Ollama ≥ 0.1.14 exposes an OpenAI-compatible endpoint at /v1.
+        Resolution order:
+          1. hermes-agent's own provider system (~/.hermes/config.yaml):
+               - `hermes login`         → Nous Research OAuth2 (free Hermes access)
+               - custom_providers       → any local endpoint (Ollama, vLLM, llama.cpp)
+               - HERMES_INFERENCE_PROVIDER env → provider override
+          2. NOUS_API_KEY env var        → Nous Research inference API
+          3. OPENROUTER_API_KEY env var  → OpenRouter
+          4. Ollama /v1                  → always available
         """
+        # 1. Try hermes-agent's config-driven resolution
+        if _AIAGENT_AVAILABLE:
+            try:
+                from hermes_cli.config import load_config as _load_hermes_config  # type: ignore[import]
+                from hermes_cli.runtime_provider import resolve_runtime_provider  # type: ignore[import]
+
+                runtime = resolve_runtime_provider()
+                base_url: str = runtime.get("base_url", "").rstrip("/")
+                api_key: str = runtime.get("api_key", "")
+                api_mode: str = runtime.get("api_mode", "chat_completions") or "chat_completions"
+
+                # Resolve model: prefer config default, else provider-specific default
+                hermes_cfg = _load_hermes_config()
+                model_cfg = hermes_cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    model: str = (model_cfg.get("default", "") or "").strip()
+                elif isinstance(model_cfg, str):
+                    model = model_cfg.strip()
+                else:
+                    model = ""
+
+                if not model:
+                    provider = runtime.get("provider", "")
+                    if provider == "nous":
+                        model = "NousResearch/Hermes-3-Llama-3.1-70B"
+                    elif provider in ("openrouter", ""):
+                        model = "nousresearch/hermes-3-llama-3.1-70b"
+                    else:
+                        model = "NousResearch/Hermes-3-Llama-3.1-70B"
+
+                if base_url and api_key:
+                    logger.debug(
+                        "[discord] resolved provider via hermes config: %s model=%s api_mode=%s",
+                        runtime.get("source", "?"), model, api_mode,
+                    )
+                    return (base_url, api_key, model, api_mode)
+            except Exception as exc:
+                logger.debug("[discord] hermes provider resolution failed: %s", exc)
+
+        # 2. NOUS_API_KEY env var
         nous_key = os.getenv("NOUS_API_KEY", "")
         if nous_key:
             return (
                 "https://inference-api.nousresearch.com/v1",
                 nous_key,
                 "NousResearch/Hermes-3-Llama-3.1-70B",
+                "chat_completions",
             )
+
+        # 3. OPENROUTER_API_KEY env var
         or_key = os.getenv("OPENROUTER_API_KEY", "")
         if or_key:
             return (
                 "https://openrouter.ai/api/v1",
                 or_key,
                 "nousresearch/hermes-3-llama-3.1-70b",
+                "chat_completions",
             )
+
+        # 4. Ollama /v1 fallback
         ollama_base = self._config.get("ollama", {}).get("url", "http://localhost:11434")
         fallback_model = (
             self._config.get("hermes_moe", {})
             .get("ollama_fallback", {})
             .get("model", "llama3.1:8b")
         )
-        return (f"{ollama_base}/v1", "ollama", fallback_model)
+        return (f"{ollama_base}/v1", "ollama", fallback_model, "chat_completions")
+
+    def _resolve_runtime_source(self) -> str:
+        """Return a human-readable label for how the current provider was resolved."""
+        if _AIAGENT_AVAILABLE:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider  # type: ignore[import]
+                runtime = resolve_runtime_provider()
+                source = runtime.get("source", "")
+                provider = runtime.get("provider", "")
+                if runtime.get("base_url") and runtime.get("api_key"):
+                    return f"{provider} ({source})" if source else provider
+            except Exception:
+                pass
+        if os.getenv("NOUS_API_KEY"):
+            return "NOUS_API_KEY env"
+        if os.getenv("OPENROUTER_API_KEY"):
+            return "OPENROUTER_API_KEY env"
+        return "ollama fallback"
 
     # ── Thread Tracking ───────────────────────────────────────────────────────
 
