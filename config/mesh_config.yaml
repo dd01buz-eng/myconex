@@ -201,7 +201,7 @@ telemetry:
 
 # ─── Discord Bot ──────────────────────────────────────────────────────────────
 discord:
-  enabled: false              # Set true to start the bot (requires DISCORD_BOT_TOKEN in .env)
+  enabled: true               # Bot starts with the node (requires DISCORD_BOT_TOKEN in .env)
   application_id: "1469408384070586432"
 
   # Access control
