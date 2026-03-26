@@ -915,17 +915,20 @@ document.addEventListener('DOMContentLoaded', () => {
 # ── Navigation ─────────────────────────────────────────────────────────────────
 
 _NAV_ITEMS = [
-    ("/",          "⊙", "Status",   "home"),
-    ("/activity",  "▣", "Activity", "activity"),
-    ("/log",       "⬡", "Bot Log",  "log"),
-    ("/submit",    "⊕", "Submit",   "submit"),
-    ("/projects",  "◆", "Projects", "projects"),
-    ("/profile",   "◎", "Profile",  "profile"),
-    ("/wisdom",    "✦", "Wisdom",   "wisdom"),
-    ("/feeds",     "⚙", "Feeds",    "feeds"),
-    ("/signals",   "⚗", "Signals",  "signals"),
-    ("/feedback",  "⚖", "Feedback", "feedback"),
-    ("/gcpdot",    "●", "GCP Dot",  "gcpdot"),
+    ("/",            "⊙", "Status",      "home"),
+    ("/chat",        "◈", "Chat",        "chat"),
+    ("/activity",    "▣", "Activity",    "activity"),
+    ("/log",         "⬡", "Bot Log",     "log"),
+    ("/submit",      "⊕", "Submit",      "submit"),
+    ("/projects",    "◆", "Projects",    "projects"),
+    ("/profile",     "◎", "Profile",     "profile"),
+    ("/wisdom",      "✦", "Wisdom",      "wisdom"),
+    ("/feeds",       "⚙", "Feeds",       "feeds"),
+    ("/signals",     "⚗", "Signals",     "signals"),
+    ("/feedback",    "⚖", "Feedback",    "feedback"),
+    ("/usage",       "◉", "Usage",       "usage"),
+    ("/bookmarklet", "⊞", "Bookmarklet", "bookmarklet"),
+    ("/gcpdot",      "●", "GCP Dot",     "gcpdot"),
 ]
 
 
@@ -1496,6 +1499,164 @@ if _FASTAPI_OK:
         )
         return _page("GCP Dot", body, "gcpdot")
 
+    @app.get("/chat", response_class=HTMLResponse)
+    async def page_chat() -> str:
+        body = (
+            '<div class="page-header">'
+            '<div class="page-title">Chat</div>'
+            '<div class="page-sub">Talk to Buzlock directly from the browser</div>'
+            '</div>'
+            '<div style="display:flex;flex-direction:column;height:calc(100vh - 140px);gap:12px">'
+
+            # Message wall
+            '<div id="chat-wall" style="'
+            'flex:1;background:var(--surface);border:1px solid var(--border);'
+            'border-radius:10px;padding:16px;overflow-y:auto;'
+            'font-size:13px;line-height:1.65;'
+            '"></div>'
+
+            # Input row
+            '<div style="display:flex;gap:10px;flex-shrink:0">'
+            '<textarea id="chat-input" rows="2" placeholder="Message Buzlock…" '
+            'style="flex:1;resize:none;min-height:52px;padding:12px 14px;font-size:13px;'
+            'background:var(--surface);border:1px solid var(--border);border-radius:8px;'
+            'color:var(--text);font-family:inherit;outline:none;transition:border-color .15s" '
+            'onkeydown="if((event.ctrlKey||event.metaKey)&&event.key===\'Enter\'){sendChat();event.preventDefault()}">'
+            '</textarea>'
+            '<button class="btn btn-teal" onclick="sendChat()" style="align-self:flex-end;height:52px;padding:0 22px">'
+            'Send'
+            '</button>'
+            '</div>'
+            '<div style="font-size:11px;color:var(--text-dim)">Ctrl+Enter to send</div>'
+            '</div>'
+
+            '<script>'
+            'const chatWall = document.getElementById("chat-wall");'
+            'function _escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}'
+            'function _addMsg(role, text, cls) {'
+            '  const d = document.createElement("div");'
+            '  const color = role==="user" ? "var(--accent)" : role==="error" ? "var(--red)" : "var(--teal)";'
+            '  const label = role==="user" ? "You" : role==="error" ? "Error" : "Buzlock";'
+            '  d.innerHTML = `<div style="margin-bottom:14px">`'
+            '    + `<span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:${color}">${label}</span>`'
+            '    + `<div style="margin-top:4px;color:var(--text);white-space:pre-wrap">${_escHtml(text)}</div>`'
+            '    + `</div>`;'
+            '  chatWall.appendChild(d);'
+            '  chatWall.scrollTop = chatWall.scrollHeight;'
+            '}'
+            'async function sendChat() {'
+            '  const inp = document.getElementById("chat-input");'
+            '  const msg = inp.value.trim(); if (!msg) return;'
+            '  inp.value = ""; inp.disabled = true;'
+            '  _addMsg("user", msg);'
+            '  const thinking = document.createElement("div");'
+            '  thinking.id = "chat-thinking";'
+            '  thinking.innerHTML = `<span style="color:var(--text-dim);font-style:italic;font-size:12px">Buzlock is thinking…</span>`;'
+            '  chatWall.appendChild(thinking);'
+            '  chatWall.scrollTop = chatWall.scrollHeight;'
+            '  try {'
+            '    const r = await fetch("/api/chat", {method:"POST",'
+            '      headers:{"Content-Type":"application/json"},'
+            '      body:JSON.stringify({message:msg})});'
+            '    const d = await r.json();'
+            '    const t = document.getElementById("chat-thinking");'
+            '    if (t) t.remove();'
+            '    if (r.ok) _addMsg("bot", d.response || "…");'
+            '    else _addMsg("error", d.detail || d.message || "Error");'
+            '  } catch(e) {'
+            '    const t = document.getElementById("chat-thinking"); if(t) t.remove();'
+            '    _addMsg("error", "Network error: "+e);'
+            '  }'
+            '  inp.disabled = false; inp.focus();'
+            '}'
+            '</script>'
+        )
+        return _page("Chat", body, "chat")
+
+    @app.get("/usage", response_class=HTMLResponse)
+    async def page_usage() -> str:
+        try:
+            from core.usage_tracker import get_stats
+            s7  = get_stats(days=7)
+            s30 = get_stats(days=30)
+        except Exception:
+            s7 = s30 = {"total_calls":0,"total_tokens":0,"total_cost_usd":0.0,
+                        "avg_latency_s":0.0,"cache_hit_rate":0,"by_model":{}}
+
+        def _card(label, value, sub=""):
+            return (f'<div class="card"><div class="card-label">{label}</div>'
+                    f'<div class="card-value">{value}</div>'
+                    f'{"<div class=card-sub>"+sub+"</div>" if sub else ""}</div>')
+
+        rows7 = "".join(
+            f'<tr><td>{m}</td><td>{d["calls"]}</td><td>{d["tokens"]:,}</td>'
+            f'<td>${d["cost"]:.4f}</td><td>{d["latency"]/d["calls"]:.1f}s</td></tr>'
+            for m, d in sorted(s7["by_model"].items(), key=lambda x: -x[1]["calls"])
+        ) or '<tr><td colspan="5" class="empty">No data yet.</td></tr>'
+
+        body = (
+            '<div class="page-header"><div class="page-title">Usage</div>'
+            '<div class="page-sub">LLM inference stats</div></div>'
+            '<h2>Last 7 days</h2>'
+            '<div class="card-grid">'
+            + _card("Calls", f'{s7["total_calls"]:,}')
+            + _card("Tokens", f'{s7["total_tokens"]:,}')
+            + _card("Cost", f'${s7["total_cost_usd"]:.4f}')
+            + _card("Avg Latency", f'{s7["avg_latency_s"]:.1f}s')
+            + _card("Cache Hit Rate", f'{s7["cache_hit_rate"]}%', f'{s7["cache_hits"]} hits')
+            + '</div>'
+            '<h2>By model (7d)</h2>'
+            '<table class="tbl"><thead><tr>'
+            '<th>Model</th><th>Calls</th><th>Tokens</th><th>Cost</th><th>Avg Latency</th>'
+            '</tr></thead><tbody>' + rows7 + '</tbody></table>'
+            '<h2>Last 30 days</h2>'
+            '<div class="card-grid">'
+            + _card("Calls", f'{s30["total_calls"]:,}')
+            + _card("Tokens", f'{s30["total_tokens"]:,}')
+            + _card("Cost", f'${s30["total_cost_usd"]:.4f}')
+            + '</div>'
+        )
+        return _page("Usage", body, "usage")
+
+    @app.get("/bookmarklet", response_class=HTMLResponse)
+    async def page_bookmarklet() -> str:
+        import urllib.parse
+        dashboard_url = os.getenv("DASHBOARD_PUBLIC_URL", "http://localhost:7860")
+        bm_js = (
+            "javascript:(function(){"
+            "var u=encodeURIComponent(location.href);"
+            "var t=encodeURIComponent(document.title);"
+            f"window.open('{dashboard_url}/api/submit/url?url='+u+'&title='+t,'_blank','width=400,height=200');"
+            "})();"
+        )
+        bm_encoded = _escape(bm_js)
+        body = (
+            '<div class="page-header"><div class="page-title">Bookmarklet</div>'
+            '<div class="page-sub">Send any page to MYCONEX in one click</div></div>'
+            '<div class="form-block" style="max-width:560px">'
+            '<p style="font-size:13px;color:var(--text);margin-bottom:18px;line-height:1.6">'
+            'Drag the button below to your browser\'s bookmarks bar. '
+            'Click it on any page to instantly send that URL to your MYCONEX knowledge base.'
+            '</p>'
+            f'<a href="{bm_encoded}" '
+            'style="display:inline-block;background:var(--teal-dim);color:var(--teal);'
+            'border:1px solid var(--teal);border-radius:8px;padding:10px 22px;'
+            'font-size:14px;font-weight:600;text-decoration:none;cursor:grab" '
+            'onclick="alert(\'Drag this to your bookmarks bar — don\\\'t click it here\');return false">'
+            '⊛ Add to MYCONEX'
+            '</a>'
+            '<div class="form-hint" style="margin-top:14px">'
+            'Right-click → Bookmark this link if drag doesn\'t work in your browser.'
+            '</div>'
+            '<hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'
+            '<div style="font-size:11px;color:var(--text-dim)">'
+            f'Submits to: <code style="color:var(--accent)">{dashboard_url}/api/submit/url</code><br>'
+            'Set <code>DASHBOARD_PUBLIC_URL</code> in .env if your dashboard runs on a custom host/port.'
+            '</div>'
+            '</div>'
+        )
+        return _page("Bookmarklet", body, "bookmarklet")
+
     # ── SSE stream ────────────────────────────────────────────────────────────
 
     @app.get("/stream/activity")
@@ -1740,6 +1901,114 @@ if _FASTAPI_OK:
     @app.get("/api/sysmon")
     async def api_sysmon() -> JSONResponse:
         return JSONResponse(_sysmon_data())
+
+    @app.post("/api/chat")
+    async def api_chat(request: Request) -> JSONResponse:
+        """Direct chat endpoint — calls the same Ollama pipeline as Discord."""
+        try:
+            body = await request.json()
+            message = str(body.get("message", "")).strip()
+            if not message:
+                return JSONResponse({"ok": False, "message": "Empty message"}, status_code=400)
+
+            import httpx
+            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            model      = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+            # Try RAG context
+            rag_ctx = ""
+            try:
+                from integrations.knowledge_store import search
+                hits = await search(message, limit=3)
+                if hits:
+                    rag_ctx = "\n\n[Knowledge base context]\n" + "\n---\n".join(
+                        h.get("text", "")[:300] for h in hits
+                    )
+            except Exception:
+                pass
+
+            system = (
+                "You are Buzlock, a personal AI assistant. "
+                "Answer concisely and helpfully."
+                + rag_ctx
+            )
+
+            t0 = time.time()
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    f"{ollama_url}/api/chat",
+                    json={
+                        "model": model,
+                        "stream": False,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user",   "content": message},
+                        ],
+                    },
+                )
+            latency = time.time() - t0
+            resp_text = r.json().get("message", {}).get("content", "").strip()
+
+            try:
+                from core.usage_tracker import record as _ur
+                _ur(model=model, prompt=message, completion=resp_text,
+                    latency_s=latency, source="dashboard")
+            except Exception:
+                pass
+
+            return JSONResponse({"ok": True, "response": resp_text or "…"})
+        except Exception as exc:
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=500)
+
+    @app.post("/api/ingest/webhook")
+    async def api_webhook(request: Request) -> JSONResponse:
+        """
+        Generic webhook ingestion endpoint.
+        Accepts JSON with any of: url, text, title, source, tags.
+        Protected by WEBHOOK_SECRET env var if set.
+        """
+        secret = os.getenv("WEBHOOK_SECRET", "")
+        if secret:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {secret}" and auth != secret:
+                return JSONResponse({"ok": False, "message": "Unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "message": "Invalid JSON"}, status_code=400)
+
+        url   = body.get("url", "").strip()
+        text  = body.get("text", "").strip()
+        title = body.get("title", "untitled")
+
+        if url:
+            # Re-use the existing URL submit pipeline
+            try:
+                from integrations.knowledge_store import store_item
+                await store_item(text=f"{title}\n{url}", source=body.get("source","webhook"),
+                                 title=title)
+                return JSONResponse({"ok": True, "message": f"URL queued: {url}"})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=500)
+        elif text:
+            try:
+                from integrations.knowledge_store import store_item
+                item_id = await store_item(text=text, source=body.get("source","webhook"),
+                                           title=title)
+                return JSONResponse({"ok": True, "message": f"Stored {item_id or 'item'}"})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=500)
+        else:
+            return JSONResponse({"ok": False, "message": "Provide 'url' or 'text'"}, status_code=400)
+
+    @app.get("/api/usage")
+    async def api_usage(days: int = 7) -> JSONResponse:
+        try:
+            from core.usage_tracker import get_stats
+            return JSONResponse(get_stats(days=days))
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
 
     @app.post("/api/submit/doc")
     async def api_submit_doc(file: UploadFile = File(...), title: str = Form("")) -> JSONResponse:

@@ -1,0 +1,141 @@
+version: "3.9"
+
+# MYCONEX — Full stack
+# Usage:
+#   cp .env.example .env   # fill in your tokens
+#   docker compose up -d
+#
+# Services:
+#   myconex   — Buzlock Discord bot + all ingesters + web dashboard
+#   qdrant    — Vector store (persistent)
+#   nats      — Mesh message bus
+#   ollama    — Local LLM inference (GPU passthrough optional)
+#   searxng   — Self-hosted search engine
+#
+# Volumes mount ~/.myconex into the container so data persists across restarts.
+# GPU: uncomment the deploy section under myconex/ollama to enable CUDA.
+
+services:
+
+  # ── Qdrant vector store ──────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: myconex_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── NATS message bus ─────────────────────────────────────────────────────────
+  nats:
+    image: nats:latest
+    container_name: myconex_nats
+    restart: unless-stopped
+    ports:
+      - "4222:4222"
+      - "8222:8222"   # monitoring
+    command: ["--http_port", "8222", "--jetstream"]
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Ollama local LLM ─────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: myconex_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    # GPU passthrough — uncomment if you have NVIDIA drivers + nvidia-container-toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  # ── SearXNG self-hosted search ───────────────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: myconex_searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    volumes:
+      - searxng_data:/etc/searxng
+    environment:
+      SEARXNG_BASE_URL: "http://localhost:8888/"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  # ── MYCONEX bot + dashboard ──────────────────────────────────────────────────
+  myconex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: myconex_bot
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    ports:
+      - "7860:7860"   # Dashboard
+    volumes:
+      - myconex_data:/root/.myconex
+      - ./plugins:/app/plugins      # hot-reload plugin directory
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST:      "qdrant"
+      QDRANT_PORT:      "6333"
+      NATS_URL:         "nats://nats:4222"
+      OLLAMA_BASE_URL:  "http://ollama:11434"
+      SEARXNG_URL:      "http://searxng:8080"
+      DASHBOARD_HOST:   "0.0.0.0"
+      DASHBOARD_PORT:   "7860"
+    # GPU passthrough — uncomment to share host GPU with the bot container
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  qdrant_data:
+  nats_data:
+  ollama_models:
+  searxng_data:
+  myconex_data:

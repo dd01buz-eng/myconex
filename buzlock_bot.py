@@ -242,6 +242,32 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Could not start weekly digest scheduler: %s", exc)
 
+    # 6q. Start Readwise + Pocket ingester
+    readwise_task = None
+    if os.getenv("READWISE_TOKEN") or (os.getenv("POCKET_CONSUMER_KEY") and os.getenv("POCKET_ACCESS_TOKEN")):
+        try:
+            from integrations.readwise_ingester import ReadwisePocketIngester
+            rw_ingester = ReadwisePocketIngester()
+            readwise_task = asyncio.create_task(_supervise("readwise_pocket", rw_ingester.run_forever))
+            logger.info("Readwise/Pocket ingester started")
+        except Exception as exc:
+            logger.warning("Could not start Readwise/Pocket ingester: %s", exc)
+    else:
+        logger.info("Readwise/Pocket ingester skipped — set READWISE_TOKEN or POCKET_* vars")
+
+    # 6r. Start Twitter/X monitor
+    twitter_task = None
+    if os.getenv("TWITTER_ACCOUNTS") or os.getenv("TWITTER_SEARCHES"):
+        try:
+            from integrations.twitter_monitor import TwitterMonitor
+            tw_monitor = TwitterMonitor()
+            twitter_task = asyncio.create_task(_supervise("twitter_monitor", tw_monitor.run_forever))
+            logger.info("Twitter monitor started — interval=%sm", os.getenv("TWITTER_INGEST_INTERVAL", "60"))
+        except Exception as exc:
+            logger.warning("Could not start Twitter monitor: %s", exc)
+    else:
+        logger.info("Twitter monitor skipped — set TWITTER_ACCOUNTS or TWITTER_SEARCHES")
+
     # 6l. Start plugin loader with hot-reload watcher
     plugin_loader = None
     try:
@@ -403,7 +429,7 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
 
-    for _t in (github_task, watchdog_task, digest_task):
+    for _t in (github_task, watchdog_task, digest_task, readwise_task, twitter_task):
         if _t:
             _t.cancel()
             try:

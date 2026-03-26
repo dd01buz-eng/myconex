@@ -114,6 +114,34 @@ FEEDBACK_FILE        = Path.home() / ".myconex" / "feedback_log.jsonl"
 _GATEWAY_MEMORY_FILE = Path.home() / ".myconex" / "memory.json"
 _USERS_DIR           = Path.home() / ".myconex" / "users"
 
+# ── Per-user rate limiter ─────────────────────────────────────────────────────
+# RATE_LIMIT_RPM: max requests per minute per user (0 = unlimited)
+_RATE_LIMIT_RPM = int(os.getenv("DISCORD_RATE_LIMIT_RPM", "20"))
+
+class _RateLimiter:
+    """Token-bucket rate limiter keyed by Discord user ID."""
+    def __init__(self, rpm: int) -> None:
+        self._rpm = rpm
+        self._buckets: Dict[str, list] = {}  # user_id -> list of timestamps
+
+    def is_allowed(self, user_id: str) -> bool:
+        if self._rpm <= 0:
+            return True
+        import time
+        now = time.monotonic()
+        window = 60.0
+        timestamps = self._buckets.get(user_id, [])
+        # Drop timestamps outside the window
+        timestamps = [t for t in timestamps if now - t < window]
+        if len(timestamps) >= self._rpm:
+            self._buckets[user_id] = timestamps
+            return False
+        timestamps.append(now)
+        self._buckets[user_id] = timestamps
+        return True
+
+_rate_limiter = _RateLimiter(_RATE_LIMIT_RPM)
+
 
 def _user_base(discord_user_id: int | str) -> Path:
     """Return the per-user data directory, creating it on first call."""
@@ -287,6 +315,46 @@ def _load_memory_for_prompt() -> str:
         return "\n".join(lines)
     except Exception:
         return ""
+
+
+async def _summarize_old_history(messages: list) -> list:
+    """
+    Compress the oldest half of a conversation by summarising it into a
+    single system message, keeping the recent half verbatim.
+    Falls back to plain trimming if summarisation fails.
+    """
+    try:
+        mid = len(messages) // 2
+        old_msgs = messages[:mid]
+        recent   = messages[mid:]
+
+        old_text = "\n".join(
+            f"{m.get('role','?').upper()}: {str(m.get('content',''))[:300]}"
+            for m in old_msgs if isinstance(m, dict)
+        )
+        prompt = (
+            f"Summarise the following conversation history in 3-5 sentences, "
+            f"preserving key decisions, facts, and context:\n\n{old_text[:4000]}"
+        )
+        import httpx
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{ollama_url}/api/generate",
+                json={"model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+                      "prompt": prompt, "stream": False},
+            )
+        summary = r.json().get("response", "").strip()
+        if summary:
+            summary_msg = {"role": "system",
+                           "content": f"[Earlier conversation summary]: {summary}"}
+            logger.info("[gateway] auto-summarised %d old messages", len(old_msgs))
+            return [summary_msg] + recent
+    except Exception as exc:
+        logger.debug("[gateway] history summarisation failed: %s", exc)
+
+    # Fallback: just trim
+    return _trim_history_to_turns(messages, MAX_HISTORY_TURNS // 2)
 
 
 # ─── Auto-RAG helper ──────────────────────────────────────────────────────────
@@ -1550,7 +1618,7 @@ class DiscordGateway:
             await interaction.response.defer(ephemeral=False)
             try:
                 from core.briefing import build_briefing_embed
-                embed_data = build_briefing_embed()
+                embed_data = await build_briefing_embed()
                 if embed_data:
                     emb = discord.Embed.from_dict(embed_data)
                     await interaction.followup.send(embed=emb)
@@ -1666,6 +1734,17 @@ class DiscordGateway:
 
         # ── Access control ────────────────────────────────────────────────────
         if self._allowed_user_ids and str(message.author.id) not in self._allowed_user_ids:
+            return
+
+        # ── Per-user rate limiting ─────────────────────────────────────────────
+        if not _rate_limiter.is_allowed(str(message.author.id)):
+            try:
+                await message.reply(
+                    f"⏳ Slow down — max {_RATE_LIMIT_RPM} requests/minute.",
+                    mention_author=False,
+                )
+            except Exception:
+                pass
             return
 
         # ── Auto-thread ───────────────────────────────────────────────────────
@@ -2031,6 +2110,7 @@ class DiscordGateway:
             _cache_eligible = False
         # ─────────────────────────────────────────────────────────────────────
 
+        _t0 = time.time()
         result: Dict[str, Any] = await asyncio.to_thread(
             agent.run_conversation,
             user_message=user_message,
@@ -2038,6 +2118,17 @@ class DiscordGateway:
             conversation_history=list(state.history),
             stream_callback=streamer.on_delta if streamer else None,
         )
+        _latency = time.time() - _t0
+        try:
+            from core.usage_tracker import record as _usage_record
+            _usage_record(
+                model=_model, prompt=user_message,
+                completion=result.get("final_response", ""),
+                latency_s=_latency, source="discord",
+                cached=False,
+            )
+        except Exception:
+            pass
 
         # Flush any remaining buffered tokens that hadn't reached the edit
         # interval yet — ensures the final partial chunk is always displayed.
@@ -2045,11 +2136,14 @@ class DiscordGateway:
             streamer._push()
 
         # Persist the updated history for the next turn.
-        # Trim by user-turn count (not raw message count) so agentic tool-call
-        # messages don't silently eat into the effective conversation window.
+        # Trim by user-turn count; auto-summarize when thread grows very long.
         messages = result.get("messages") or []
         if messages:
-            state.history = _trim_history_to_turns(messages, MAX_HISTORY_TURNS)
+            trimmed = _trim_history_to_turns(messages, MAX_HISTORY_TURNS)
+            # Auto-summarize: if history is near the limit, compress the oldest half
+            if len([m for m in trimmed if isinstance(m, dict) and m.get("role") == "user"]) >= MAX_HISTORY_TURNS - 5:
+                trimmed = await _summarize_old_history(trimmed)
+            state.history = trimmed
             _history_save(key, state.history)
 
         # ── Store result in cache if eligible and no tool calls were used ────

@@ -124,7 +124,7 @@ def build_briefing_data(lookback_hours: int = BRIEFING_LOOKBACK) -> dict[str, An
     }
 
 
-def build_briefing_embed(lookback_hours: int = BRIEFING_LOOKBACK) -> dict[str, Any]:
+async def build_briefing_embed(lookback_hours: int = BRIEFING_LOOKBACK) -> dict[str, Any]:
     """Build a Discord embed dict for the morning briefing."""
     d = build_briefing_data(lookback_hours)
     now = datetime.now().strftime("%A, %B %d")  # e.g. "Monday, March 25"
@@ -275,7 +275,7 @@ class MorningBriefing:
         while self._running:
             try:
                 if _briefing_due():
-                    embed = build_briefing_embed()
+                    embed = await build_briefing_embed()
                     if embed:
                         await self._post_fn(embed)
                         _mark_sent()
