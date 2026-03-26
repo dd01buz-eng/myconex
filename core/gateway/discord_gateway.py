@@ -266,12 +266,45 @@ def _load_memory_for_prompt() -> str:
 
 # ─── Auto-RAG helper ──────────────────────────────────────────────────────────
 
+_RAG_SKIP_PHRASES = frozenset({
+    # Acknowledgements
+    "ok", "okay", "k", "yes", "no", "yep", "nope", "yeah", "nah", "sure",
+    "thanks", "thank you", "thx", "ty", "np", "no problem", "got it",
+    "understood", "cool", "nice", "great", "good", "perfect", "awesome",
+    # Continuations
+    "go", "do it", "yes do it", "proceed", "continue", "next", "more",
+    "go ahead", "sounds good", "that works", "looks good", "lgtm",
+    # Short commands
+    "stop", "cancel", "retry", "again", "redo", "reset", "help",
+    # Reactions
+    "lol", "haha", "wow", "nice one", "good job", "well done",
+})
+
+
+def _rag_is_trivial(query: str) -> bool:
+    """Return True if the message is too short or generic to benefit from RAG."""
+    q = query.strip().lower().rstrip("!?.")
+    if len(q) < 15:
+        return True
+    if q in _RAG_SKIP_PHRASES:
+        return True
+    # Single-word or two-word queries that are just filler
+    words = q.split()
+    if len(words) <= 2 and all(w in _RAG_SKIP_PHRASES for w in words):
+        return True
+    return False
+
+
 async def _rag_context(query: str) -> str:
     """
     Query the Qdrant knowledge base with the user's message and return a
     formatted context block (empty string if unavailable or no results).
+    Skips the query entirely for trivial / short messages to save ~350ms.
     """
     if not query or not query.strip():
+        return ""
+    if _rag_is_trivial(query):
+        logger.debug("[discord] RAG skipped (trivial message: %r)", query[:40])
         return ""
     try:
         from integrations.knowledge_store import search
