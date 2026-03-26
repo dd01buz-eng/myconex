@@ -597,6 +597,66 @@ class MeshDiscovery:
         return False
 
 
+# ─── Public API ───────────────────────────────────────────────────────────────
+
+async def resolve_service_urls(
+    zc: "AsyncZeroconf",
+    cfg: Any,
+    timeout: float = 10.0,
+) -> tuple[ServiceURLs, "ServiceWatcher"]:
+    """
+    Resolve hub service URLs via mDNS discovery with env var priority.
+
+    Priority per service (independently):
+      1. Explicit user config: env var or .env file value (highest priority)
+      2. mDNS discovery (waits up to timeout seconds)
+      3. ServiceDiscoveryError (fail fast with diagnostic message)
+
+    Returns:
+        (ServiceURLs, ServiceWatcher) — URLs and the live watcher (keep for reconnect)
+
+    Raises:
+        ServiceDiscoveryError — if any service has no URL from either source
+    """
+    watcher = ServiceWatcher(zc=zc)
+    await watcher.start()
+
+    # Wait for mDNS results
+    await asyncio.sleep(min(timeout, 10.0))
+    _urls_result = watcher.get_urls()
+    if asyncio.iscoroutine(_urls_result):
+        discovered = await _urls_result
+    else:
+        discovered = _urls_result
+
+    def _resolve(env_key: str, mdns_url: Optional[str], label: str) -> str:
+        # Priority 1: explicit user config (env var or .env, both land in os.environ)
+        if (v := os.environ.get(env_key)):
+            logger.info(f"[discovery] {label}: using explicit config ({env_key}={v})")
+            return v
+        # Priority 2: mDNS
+        if mdns_url:
+            logger.info(f"[discovery] {label}: resolved via mDNS → {mdns_url}")
+            return mdns_url
+        # Priority 3: fail
+        raise ServiceDiscoveryError(
+            f"Could not resolve {label}.\n"
+            f"  Tried: mDNS (_{label.lower()}._tcp.local.) — not found after {timeout:.0f}s\n"
+            f"  Tried: {env_key} env var — not set by user\n"
+            f"  Fix: start the hub first, or set {env_key} in .env"
+        )
+
+    nats_url   = _resolve("NATS_URL",   discovered.nats_url,   "NATS")
+    redis_url  = _resolve("REDIS_URL",  discovered.redis_url,  "Redis")
+    qdrant_url = _resolve("QDRANT_URL", discovered.qdrant_url, "Qdrant")
+
+    return ServiceURLs(
+        nats_url=nats_url,
+        redis_url=redis_url,
+        qdrant_url=qdrant_url,
+    ), watcher
+
+
 # ─── CLI / standalone ─────────────────────────────────────────────────────────
 
 async def _demo():

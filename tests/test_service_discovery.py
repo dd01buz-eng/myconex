@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.discovery.mesh_discovery import ServiceURLs, ServiceDiscoveryError, MeshDiscovery, ServiceAdvertiser, ServiceWatcher
+from core.discovery.mesh_discovery import ServiceURLs, ServiceDiscoveryError, MeshDiscovery, ServiceAdvertiser, ServiceWatcher, resolve_service_urls
 
 
 class TestServiceURLs(unittest.TestCase):
@@ -196,6 +196,126 @@ class TestServiceWatcher(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertIsNotNone(received[0].nats_url)
         self.assertIsNone(received[0].redis_url)
+
+
+class TestResolveServiceUrls(unittest.TestCase):
+
+    def _make_cfg(self, nats=None, redis=None, qdrant=None):
+        cfg = MagicMock()
+        cfg.mesh.nats_url   = nats   or "nats://localhost:4222"
+        cfg.mesh.redis_url  = redis  or "redis://localhost:6379"
+        cfg.mesh.qdrant_url = qdrant or "http://localhost:6333"
+        return cfg
+
+    def test_env_vars_take_priority_over_mdns(self):
+        """If env var is set, skip mDNS for that service."""
+        cfg = self._make_cfg()
+        mock_zc = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NATS_URL": "nats://myserver:4222",
+            "REDIS_URL": "redis://myserver:6379",
+            "QDRANT_URL": "http://myserver:6333",
+        }):
+            async def run():
+                with patch(
+                    'core.discovery.mesh_discovery.ServiceWatcher'
+                ) as MockWatcher:
+                    mock_watcher = AsyncMock()
+                    mock_watcher.get_urls.return_value = ServiceURLs()  # empty — mDNS found nothing
+                    mock_watcher.start = AsyncMock()
+                    MockWatcher.return_value = mock_watcher
+
+                    urls, watcher = await resolve_service_urls(
+                        zc=mock_zc, cfg=cfg, timeout=0.1
+                    )
+                    self.assertEqual(urls.nats_url, "nats://myserver:4222")
+                    self.assertEqual(urls.redis_url, "redis://myserver:6379")
+                    self.assertEqual(urls.qdrant_url, "http://myserver:6333")
+
+            asyncio.run(run())
+
+    def test_mdns_used_when_no_env_var(self):
+        """mDNS result used when env var is not set."""
+        cfg = self._make_cfg()
+        mock_zc = MagicMock()
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("NATS_URL", "REDIS_URL", "QDRANT_URL")}
+
+        async def run():
+            with patch.dict(os.environ, env, clear=True):
+                with patch(
+                    'core.discovery.mesh_discovery.ServiceWatcher'
+                ) as MockWatcher:
+                    mock_watcher = AsyncMock()
+                    mock_watcher.get_urls.return_value = ServiceURLs(
+                        nats_url="nats://hub:4222",
+                        redis_url="redis://hub:6379",
+                        qdrant_url="http://hub:6333",
+                    )
+                    mock_watcher.start = AsyncMock()
+                    MockWatcher.return_value = mock_watcher
+
+                    urls, watcher = await resolve_service_urls(
+                        zc=mock_zc, cfg=cfg, timeout=0.1
+                    )
+                    self.assertEqual(urls.nats_url, "nats://hub:4222")
+
+        asyncio.run(run())
+
+    def test_raises_when_no_env_var_and_no_mdns(self):
+        """ServiceDiscoveryError when env var absent and mDNS found nothing."""
+        cfg = self._make_cfg()
+        mock_zc = MagicMock()
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("NATS_URL", "REDIS_URL", "QDRANT_URL")}
+
+        async def run():
+            with patch.dict(os.environ, env, clear=True):
+                with patch(
+                    'core.discovery.mesh_discovery.ServiceWatcher'
+                ) as MockWatcher:
+                    mock_watcher = AsyncMock()
+                    mock_watcher.get_urls.return_value = ServiceURLs()  # nothing found
+                    mock_watcher.start = AsyncMock()
+                    MockWatcher.return_value = mock_watcher
+
+                    with self.assertRaises(ServiceDiscoveryError) as ctx:
+                        await resolve_service_urls(
+                            zc=mock_zc, cfg=cfg, timeout=0.1
+                        )
+                    self.assertIn("NATS", str(ctx.exception))
+                    self.assertIn("Fix:", str(ctx.exception))
+
+        asyncio.run(run())
+
+    def test_returns_live_watcher(self):
+        """resolve_service_urls returns a live ServiceWatcher for reconnect use."""
+        cfg = self._make_cfg()
+        mock_zc = MagicMock()
+
+        with patch.dict(os.environ, {
+            "NATS_URL": "nats://x:4222",
+            "REDIS_URL": "redis://x:6379",
+            "QDRANT_URL": "http://x:6333",
+        }):
+            async def run():
+                with patch(
+                    'core.discovery.mesh_discovery.ServiceWatcher'
+                ) as MockWatcher:
+                    mock_watcher = AsyncMock()
+                    mock_watcher.get_urls.return_value = ServiceURLs()
+                    mock_watcher.start = AsyncMock()
+                    MockWatcher.return_value = mock_watcher
+
+                    urls, watcher = await resolve_service_urls(
+                        zc=mock_zc, cfg=cfg, timeout=0.1
+                    )
+                    self.assertIs(watcher, mock_watcher)
+
+            asyncio.run(run())
 
 
 if __name__ == '__main__':
