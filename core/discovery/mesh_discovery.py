@@ -307,6 +307,13 @@ class MeshDiscovery:
     def service_name(self) -> str:
         return f"MYCONEX-{self.node_name}"
 
+    @property
+    def zeroconf(self) -> "AsyncZeroconf":
+        """Return the running AsyncZeroconf instance (raises if not started)."""
+        if self._zeroconf is None:
+            raise RuntimeError("MeshDiscovery not started — call start() first")
+        return self._zeroconf
+
     def _get_local_addresses(self) -> list[str]:
         addrs = []
         try:
