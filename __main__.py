@@ -35,7 +35,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ── Optional rich console (degrade gracefully) ────────────────────────────────
 try:
@@ -116,6 +116,57 @@ def _load_config(config_path: Optional[str]) -> dict:
     return load_config(config_path)
 
 
+async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Optional[Any]]:
+    """
+    Run mDNS service discovery and update the global config in-place.
+
+    Loads a typed MyconexConfig, runs mDNS advertisement and resolution, and
+    applies discovered URLs back to the global config singleton so all service
+    clients pick them up.
+
+    Returns (watcher, advertiser) — keep both references for shutdown cleanup.
+    Returns (None, None) if discovery is unavailable or not needed.
+    """
+    try:
+        from config import load_config, apply_discovered_urls
+        from core.discovery.mesh_discovery import (
+            ServiceAdvertiser,
+            resolve_service_urls,
+            ServiceDiscoveryError,
+        )
+        from zeroconf.asyncio import AsyncZeroconf
+    except ImportError as e:
+        logger.debug(f"Service discovery unavailable: {e}")
+        return None, None
+
+    try:
+        cfg = load_config()
+        zc = AsyncZeroconf()
+
+        # Advertise local services (hub nodes will register; worker nodes probe nothing)
+        advertiser = ServiceAdvertiser(zc=zc, node_name=cfg.mesh.node_name or "node", cfg=cfg)
+        await advertiser.start()
+
+        # Discover hub services
+        urls, watcher = await resolve_service_urls(zc=zc, cfg=cfg, timeout=10.0)
+        apply_discovered_urls(cfg, urls)
+
+        if verbose:
+            logger.info(f"[discovery] NATS:   {cfg.mesh.nats_url}")
+            logger.info(f"[discovery] Redis:  {cfg.mesh.redis_url}")
+            logger.info(f"[discovery] Qdrant: {cfg.mesh.qdrant_url}")
+
+        return watcher, advertiser
+
+    except Exception as e:
+        # Check if it's a ServiceDiscoveryError (imported locally so check by name)
+        if type(e).__name__ == "ServiceDiscoveryError":
+            logger.error(str(e))
+            sys.exit(1)
+        logger.debug(f"Service discovery skipped: {e}")
+        return None, None
+
+
 async def _input_async(prompt: str = "") -> str:
     """Non-blocking stdin read — runs input() in a thread so the event loop stays live."""
     loop = asyncio.get_running_loop()
@@ -143,6 +194,9 @@ async def boot_rlm_agent(config: dict, verbose: bool = False):
 
     if verbose:
         logging.getLogger("myconex").setLevel(logging.INFO)
+
+    # Discover mesh services via mDNS (falls back to .env, fails loudly if neither)
+    _service_watcher, _service_advertiser = await _discover_services(verbose=verbose)
 
     ollama_url   = config.get("ollama", {}).get("url", "http://localhost:11434")
     litellm_url  = config.get("litellm", {}).get("url", "http://localhost:4000")
@@ -236,7 +290,7 @@ async def boot_rlm_agent(config: dict, verbose: bool = False):
         except Exception as exc:
             logger.debug("hermes integration skipped: %s", exc)
 
-    return agent, router
+    return agent, router, _service_watcher, _service_advertiser
 
 
 # ─── Mode: CLI REPL ───────────────────────────────────────────────────────────
@@ -259,7 +313,7 @@ async def run_cli(config: dict, verbose: bool = False) -> None:
     _banner()
     _info("Booting RLMAgent…")
 
-    agent, router = await boot_rlm_agent(config, verbose=verbose)
+    agent, router, _watcher, _advertiser = await boot_rlm_agent(config, verbose=verbose)
 
     _success(f"RLMAgent ready  [model={agent.config.model}  backend={agent.config.backend}]")
     if _RICH:
@@ -401,6 +455,8 @@ async def run_cli(config: dict, verbose: bool = False) -> None:
             _error(f"Error: {result.error}")
 
     _info("\nShutting down…")
+    if _watcher: await _watcher.stop()
+    if _advertiser: await _advertiser.stop()
     await router.stop()
     _success("Goodbye.")
 
@@ -598,7 +654,7 @@ async def run_autonomous(config: dict, interval_s: float = 5.0, verbose: bool = 
     _banner()
     _info("Booting RLMAgent for autonomous operation…")
 
-    agent, router = await boot_rlm_agent(config, verbose=verbose)
+    agent, router, _watcher, _advertiser = await boot_rlm_agent(config, verbose=verbose)
 
     # Ensure task queue file exists
     _MYCONEX_DIR.mkdir(parents=True, exist_ok=True)
@@ -765,6 +821,8 @@ async def run_autonomous(config: dict, interval_s: float = 5.0, verbose: bool = 
     if bg_tasks:
         await asyncio.gather(*bg_tasks, return_exceptions=True)
 
+    if _watcher: await _watcher.stop()
+    if _advertiser: await _advertiser.stop()
     await router.stop()
 
 
@@ -780,7 +838,7 @@ async def run_discord_with_rlm(config: dict, verbose: bool = False) -> None:
     _banner()
     _info("Booting RLMAgent + Discord gateway…")
 
-    agent, router = await boot_rlm_agent(config, verbose=verbose)
+    agent, router, _watcher, _advertiser = await boot_rlm_agent(config, verbose=verbose)
 
     # Hand off to the existing mesh runner with mode="discord"
     sys.path.insert(0, str(Path(__file__).parent))
@@ -795,6 +853,8 @@ async def run_discord_with_rlm(config: dict, verbose: bool = False) -> None:
         # letting it boot its own router alongside the Discord gateway.
         await run_node(config, mode="discord")
     finally:
+        if _watcher: await _watcher.stop()
+        if _advertiser: await _advertiser.stop()
         await router.stop()
 
 
