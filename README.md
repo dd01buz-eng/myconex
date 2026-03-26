@@ -432,6 +432,116 @@ The self-improvement loop:
 
 ---
 
+## Deployment
+
+### Single Machine (quickest start)
+
+Run everything on one box to verify it works before adding more nodes:
+
+```bash
+# Start infrastructure services
+cd services && docker compose up -d && cd ..
+
+# Start MYCONEX (Discord + API + mesh worker)
+python3 -m myconex --mode full
+```
+
+This runs NATS, Redis, Qdrant, Ollama, and LiteLLM locally, with MYCONEX connecting to all of them on `localhost`.
+
+---
+
+### Multi-Machine Mesh
+
+Each machine becomes a node. Services only need to run on **one hub machine** — all other nodes point at it.
+
+```
+Hub PC (T1 · GPU)                 Worker Pi (T3 · CPU)
+├── docker compose (services)     ├── python -m myconex --mode worker
+├── NATS · Redis · Qdrant         └── connects to hub's IP
+├── Discord gateway
+└── python -m myconex --mode full
+              ↕  NATS pub/sub  ↕
+              ↕  Redis state   ↕
+```
+
+**Step 1 — Hub machine:** start the service stack and note its local IP (e.g. `192.168.1.100`):
+
+```bash
+cd services && docker compose up -d
+python3 -m myconex --mode full
+```
+
+**Step 2 — Every other machine:** clone, install, and point at the hub:
+
+```bash
+git clone https://github.com/dd01buz-eng/myconex.git
+cd myconex
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env` on each worker node:
+
+```bash
+NATS_URL=nats://192.168.1.100:4222
+REDIS_URL=redis://192.168.1.100:6379
+QDRANT_URL=http://192.168.1.100:6333
+OLLAMA_URL=http://192.168.1.100:11434
+```
+
+Then start the worker:
+
+```bash
+python3 -m myconex --mode worker
+```
+
+Each node auto-detects its hardware, assigns a tier, and announces itself to the mesh via mDNS. The hub's orchestrator sees it and starts routing tasks to it automatically.
+
+---
+
+### Infrastructure Services Reference
+
+The `services/docker-compose.yml` stack includes:
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| NATS | `4222` | Mesh pub/sub messaging |
+| Redis | `6379` | Shared state + LiteLLM cache |
+| Qdrant | `6333` | Vector store / RAG |
+| Ollama | `11434` | Local LLM inference fallback |
+| LiteLLM | `4000` | LLM proxy / router |
+| MYCONEX API | `8765` | REST gateway (optional, `--profile full`) |
+
+To start just the core services without the API container:
+
+```bash
+cd services && docker compose up -d
+```
+
+To also run the containerised MYCONEX API:
+
+```bash
+cd services && docker compose --profile full up -d
+```
+
+> **NVIDIA GPU:** Uncomment the `deploy.resources` block in `services/docker-compose.yml` under the `ollama` service to enable GPU passthrough.
+
+---
+
+### Tier Reference
+
+Hardware is auto-detected at startup. Override with `MYCONEX_TIER` in `.env`:
+
+| Tier | Hardware | Primary Model |
+|------|----------|---------------|
+| T1 | 70B+ GPU | Nous-Hermes 70B (flash-moe) |
+| T2 | 8B GPU | Nous-Hermes 8B |
+| T3 | CPU only | Ollama fallback |
+| T4 | Edge / IoT | BitNet 1-bit |
+
+---
+
 ## Discord Bot Setup
 
 To use MYCONEX via Discord:
