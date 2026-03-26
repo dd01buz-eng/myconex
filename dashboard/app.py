@@ -49,9 +49,17 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import psutil as _psutil
+    _PSUTIL_OK = True
+except ImportError:
+    _psutil = None  # type: ignore[assignment]
+    _PSUTIL_OK = False
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +137,48 @@ def _feedback_stats() -> dict[str, Any]:
         "negative": total - pos,
         "rate":     round(pos / total * 100) if total else None,
         "recent":   fb[-10:][::-1],
+    }
+
+
+def _sysmon_data() -> dict[str, Any]:
+    """Return live system resource stats for the sidebar monitor."""
+    if not _PSUTIL_OK:
+        return {"available": False}
+
+    cpu_pct  = _psutil.cpu_percent(interval=0.2)
+    mem      = _psutil.virtual_memory()
+    disk     = _psutil.disk_usage("/")
+    net      = _psutil.net_io_counters()
+    temps: dict[str, float] = {}
+    try:
+        raw = _psutil.sensors_temperatures()
+        if raw:
+            for key in ("coretemp", "cpu_thermal", "k10temp", "acpitz"):
+                if key in raw and raw[key]:
+                    temps["cpu"] = round(raw[key][0].current, 1)
+                    break
+    except Exception:
+        pass
+
+    uptime_s = int(time.time() - _psutil.boot_time())
+    h, rem   = divmod(uptime_s, 3600)
+    m        = rem // 60
+    uptime   = f"{h}h {m}m" if h else f"{m}m"
+
+    return {
+        "available":  True,
+        "cpu_pct":    round(cpu_pct, 1),
+        "mem_pct":    round(mem.percent, 1),
+        "mem_used_gb": round(mem.used / 1e9, 1),
+        "mem_total_gb": round(mem.total / 1e9, 1),
+        "disk_pct":   round(disk.percent, 1),
+        "disk_used_gb": round(disk.used / 1e9, 1),
+        "disk_total_gb": round(disk.total / 1e9, 1),
+        "net_sent_mb": round(net.bytes_sent / 1e6, 1),
+        "net_recv_mb": round(net.bytes_recv / 1e6, 1),
+        "cpu_temp":   temps.get("cpu"),
+        "uptime":     uptime,
+        "load":       list(_psutil.getloadavg()),
     }
 
 
@@ -233,7 +283,61 @@ body {
   margin-left: auto; font-size: 10px; opacity: .7; font-variant-numeric: tabular-nums;
 }
 .sidebar-footer {
-  margin-top: auto; padding-bottom: 12px; border-top: 1px solid var(--border); padding-top: 8px;
+  padding-bottom: 12px; border-top: 1px solid var(--border); padding-top: 8px;
+}
+
+/* ── System Monitor ── */
+.sysmon {
+  border-top: 1px solid var(--border);
+  padding: 14px 16px 10px;
+  margin-top: auto;
+  flex-shrink: 0;
+}
+.sysmon-title {
+  font-size: 9px; font-weight: 700; letter-spacing: 1.5px;
+  text-transform: uppercase; color: var(--text-dim);
+  margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+}
+.sysmon-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); flex-shrink: 0;
+  animation: pulse 3s ease-in-out infinite;
+}
+.sysmon-row {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 7px; min-width: 0;
+}
+.sysmon-label {
+  font-size: 10px; color: var(--text-dim); width: 34px;
+  flex-shrink: 0; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .6px;
+}
+.sysmon-bar-wrap {
+  flex: 1; background: var(--surface3); border-radius: 3px;
+  height: 5px; overflow: hidden; min-width: 0;
+}
+.sysmon-bar {
+  height: 100%; border-radius: 3px;
+  transition: width .6s ease, background-color .6s ease;
+  background: var(--accent);
+}
+.sysmon-bar.warn  { background: var(--amber); }
+.sysmon-bar.crit  { background: var(--red); }
+.sysmon-val {
+  font-size: 10px; color: var(--text); font-variant-numeric: tabular-nums;
+  width: 32px; text-align: right; flex-shrink: 0;
+  white-space: nowrap;
+}
+.sysmon-extra {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--text-dim);
+  margin-top: 6px; padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.sysmon-extra span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sysmon-na {
+  font-size: 10px; color: var(--text-dim); font-style: italic;
+  text-align: center; padding: 6px 0;
 }
 
 /* ── Main ── */
@@ -737,7 +841,63 @@ function toggleWatchMode() {
   }
 }
 
-// On every page load: resume watch mode if it was active
+// ── System Monitor ────────────────────────────────────────────────────────────
+function _barClass(pct) {
+  if (pct >= 90) return 'crit';
+  if (pct >= 70) return 'warn';
+  return '';
+}
+
+function _setBar(id, pct) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.width = Math.min(pct, 100) + '%';
+  el.className   = 'sysmon-bar ' + _barClass(pct);
+}
+
+function _setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+async function refreshSysmon() {
+  try {
+    const r = await fetch('/api/sysmon');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.available) return;
+
+    _setBar  ('sm-cpu-bar',  d.cpu_pct);
+    _setText ('sm-cpu-val',  d.cpu_pct + '%');
+
+    _setBar  ('sm-mem-bar',  d.mem_pct);
+    _setText ('sm-mem-val',  d.mem_pct + '%');
+
+    _setBar  ('sm-disk-bar', d.disk_pct);
+    _setText ('sm-disk-val', d.disk_pct + '%');
+
+    const tempStr = d.cpu_temp != null ? d.cpu_temp + '°' : '—';
+    _setText('sm-temp', tempStr);
+    _setText('sm-uptime', d.uptime || '—');
+    _setText('sm-net', '↑' + d.net_sent_mb + ' ↓' + d.net_recv_mb + ' MB');
+
+    // Colour temp indicator
+    const tempEl = document.getElementById('sm-temp');
+    if (tempEl && d.cpu_temp != null) {
+      tempEl.style.color = d.cpu_temp >= 85 ? 'var(--red)'
+                         : d.cpu_temp >= 70 ? 'var(--amber)'
+                         : 'var(--text-dim)';
+    }
+  } catch (_) {}
+}
+
+function initSysmon() {
+  if (!document.getElementById('sm-cpu-bar')) return;
+  refreshSysmon();
+  setInterval(refreshSysmon, 3000);
+}
+
+// On every page load: resume watch mode + start sysmon
 document.addEventListener('DOMContentLoaded', () => {
   const cd = document.getElementById('watch-countdown');
   if (localStorage.getItem('watchMode') === '1') {
@@ -747,6 +907,7 @@ document.addEventListener('DOMContentLoaded', () => {
     _watchUpdateBtn(false);
     if (cd) cd.style.display = 'none';
   }
+  initSysmon();
 });
 </script>"""
 
@@ -764,6 +925,7 @@ _NAV_ITEMS = [
     ("/feeds",     "⚙", "Feeds",    "feeds"),
     ("/signals",   "⚗", "Signals",  "signals"),
     ("/feedback",  "⚖", "Feedback", "feedback"),
+    ("/gcpdot",    "●", "GCP Dot",  "gcpdot"),
 ]
 
 
@@ -775,6 +937,35 @@ def _sidebar(active: str = "") -> str:
             f'<a href="{href}" class="{cls}">'
             f'<span class="nav-icon">{icon}</span>{label}</a>\n'
         )
+    sysmon_html = (
+        '<div class="sysmon">'
+          '<div class="sysmon-title">'
+            '<span class="sysmon-dot"></span>'
+            'System'
+          '</div>'
+          '<div class="sysmon-row">'
+            '<span class="sysmon-label">CPU</span>'
+            '<div class="sysmon-bar-wrap"><div class="sysmon-bar" id="sm-cpu-bar" style="width:0%"></div></div>'
+            '<span class="sysmon-val" id="sm-cpu-val">—</span>'
+          '</div>'
+          '<div class="sysmon-row">'
+            '<span class="sysmon-label">RAM</span>'
+            '<div class="sysmon-bar-wrap"><div class="sysmon-bar" id="sm-mem-bar" style="width:0%"></div></div>'
+            '<span class="sysmon-val" id="sm-mem-val">—</span>'
+          '</div>'
+          '<div class="sysmon-row">'
+            '<span class="sysmon-label">Disk</span>'
+            '<div class="sysmon-bar-wrap"><div class="sysmon-bar" id="sm-disk-bar" style="width:0%"></div></div>'
+            '<span class="sysmon-val" id="sm-disk-val">—</span>'
+          '</div>'
+          '<div class="sysmon-extra">'
+            '<span title="CPU temperature" id="sm-temp">—</span>'
+            '<span title="Network I/O" id="sm-net" style="flex:1;text-align:center">—</span>'
+            '<span title="Uptime" id="sm-uptime">—</span>'
+          '</div>'
+        '</div>'
+    )
+
     return (
         '<nav class="sidebar">'
         '<div class="sidebar-brand">'
@@ -782,6 +973,7 @@ def _sidebar(active: str = "") -> str:
         '<div class="brand-sub">Knowledge Mesh</div>'
         '</div>'
         f'{links}'
+        f'{sysmon_html}'
         '<div class="sidebar-footer">'
         '<button id="watch-btn" class="watch-btn" onclick="toggleWatchMode()">'
         '<span class="watch-dot"></span>'
@@ -1201,6 +1393,68 @@ if _FASTAPI_OK:
         )
         return _page("Feedback", body, "feedback")
 
+    @app.get("/gcpdot", response_class=HTMLResponse)
+    async def page_gcpdot() -> str:
+        body = (
+            '<div class="page-header">'
+            '<div class="page-title">GCP Dot</div>'
+            '<div class="page-sub">Global Consciousness Project — real-time coherence indicator</div>'
+            '</div>'
+            '<div style="display:flex;flex-direction:column;align-items:center;gap:28px;padding:40px 0">'
+
+            # Dot iframe
+            '<div style="'
+            'background:var(--surface);border:1px solid var(--border);border-radius:16px;'
+            'padding:36px 40px;display:flex;flex-direction:column;align-items:center;gap:20px;'
+            'box-shadow:0 4px 32px rgba(0,0,0,.5);max-width:340px;width:100%'
+            '">'
+            '<iframe src="https://global-mind.org/gcpdot/gcp.html" '
+            'height="160" width="160" scrolling="no" marginwidth="0" marginheight="0" '
+            'frameborder="0" '
+            'style="border:none;display:block;border-radius:8px;background:transparent" '
+            'title="GCP Dot live indicator">'
+            '</iframe>'
+
+            # Legend
+            '<div style="text-align:center;max-width:280px">'
+            '<div style="font-size:13px;color:var(--text);font-weight:500;margin-bottom:8px">'
+            'Global Consciousness Project</div>'
+            '<div style="font-size:12px;color:var(--text-dim);line-height:1.6">'
+            'Dot colour reflects statistical deviation across a worldwide network of '
+            'random-number generators. Deep blue = significant coherence. '
+            'Red/orange = notable deviation.'
+            '</div>'
+            '</div>'
+
+            # Colour key
+            '<div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center">'
+            + "".join(
+                f'<div style="display:flex;align-items:center;gap:6px">'
+                f'<span style="width:10px;height:10px;border-radius:50%;background:{bg};flex-shrink:0"></span>'
+                f'<span style="font-size:11px;color:var(--text-dim)">{label}</span>'
+                f'</div>'
+                for bg, label in [
+                    ("#1a66ff", "Significant"),
+                    ("#00bbff", "Moderate"),
+                    ("#aaaaaa", "Neutral"),
+                    ("#ffaa00", "Notable"),
+                    ("#ff2200", "Striking"),
+                ]
+            )
+            + '</div>'
+            '</div>'
+
+            # Attribution link
+            '<div style="font-size:11px;color:var(--text-dim);text-align:center">'
+            'Data source: <a href="https://global-mind.org" target="_blank" rel="noopener">'
+            'global-mind.org</a> &nbsp;·&nbsp; '
+            '<a href="https://noosphere.princeton.edu" target="_blank" rel="noopener">'
+            'noosphere.princeton.edu</a>'
+            '</div>'
+            '</div>'
+        )
+        return _page("GCP Dot", body, "gcpdot")
+
     # ── SSE stream ────────────────────────────────────────────────────────────
 
     @app.get("/stream/activity")
@@ -1441,6 +1695,10 @@ if _FASTAPI_OK:
     @app.get("/api/feedback")
     async def api_feedback() -> JSONResponse:
         return JSONResponse(_feedback_stats())
+
+    @app.get("/api/sysmon")
+    async def api_sysmon() -> JSONResponse:
+        return JSONResponse(_sysmon_data())
 
 else:
     app = None  # type: ignore[assignment]
