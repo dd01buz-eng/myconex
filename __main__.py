@@ -116,7 +116,7 @@ def _load_config(config_path: Optional[str]) -> dict:
     return load_config(config_path)
 
 
-async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Optional[Any]]:
+async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Optional[Any], Optional[Any]]:
     """
     Run mDNS service discovery and update the global config in-place.
 
@@ -124,8 +124,10 @@ async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Opti
     applies discovered URLs back to the global config singleton so all service
     clients pick them up.
 
-    Returns (watcher, advertiser) — keep both references for shutdown cleanup.
-    Returns (None, None) if discovery is unavailable or not needed.
+    Returns (watcher, advertiser, cfg) — keep watcher/advertiser for shutdown
+    cleanup; cfg carries the resolved mesh URLs so callers can bridge them into
+    legacy dict config and os.environ.
+    Returns (None, None, None) if discovery is unavailable or not needed.
     """
     try:
         from config import load_config, apply_discovered_urls
@@ -137,7 +139,7 @@ async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Opti
         from zeroconf.asyncio import AsyncZeroconf
     except ImportError as e:
         logger.debug(f"Service discovery unavailable: {e}")
-        return None, None
+        return None, None, None
 
     try:
         cfg = load_config()
@@ -156,7 +158,7 @@ async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Opti
             logger.info(f"[discovery] Redis:  {cfg.mesh.redis_url}")
             logger.info(f"[discovery] Qdrant: {cfg.mesh.qdrant_url}")
 
-        return watcher, advertiser
+        return watcher, advertiser, cfg
 
     except Exception as e:
         # Check if it's a ServiceDiscoveryError (imported locally so check by name)
@@ -164,7 +166,7 @@ async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Opti
             logger.error(str(e))
             sys.exit(1)
         logger.debug(f"Service discovery skipped: {e}")
-        return None, None
+        return None, None, None
 
 
 async def _input_async(prompt: str = "") -> str:
@@ -196,7 +198,29 @@ async def boot_rlm_agent(config: dict, verbose: bool = False):
         logging.getLogger("myconex").setLevel(logging.INFO)
 
     # Discover mesh services via mDNS (falls back to .env, fails loudly if neither)
-    _service_watcher, _service_advertiser = await _discover_services(verbose=verbose)
+    _service_watcher, _service_advertiser, _discovered_cfg = await _discover_services(verbose=verbose)
+
+    # Bridge mDNS-resolved URLs into os.environ and the legacy config dict so
+    # that MeshOrchestrator (reads config["nats"]["url"]) and remote_handler.py
+    # (reads os.environ["NATS_URL"] at module import time — set here before
+    # any deferred import of that module) both pick up the discovered addresses.
+    if _discovered_cfg is not None:
+        _url_map = {
+            "NATS_URL":   _discovered_cfg.mesh.nats_url,
+            "REDIS_URL":  _discovered_cfg.mesh.redis_url,
+            "QDRANT_URL": _discovered_cfg.mesh.qdrant_url,
+        }
+        _cfg_map = {
+            "NATS_URL":   ("nats",   "url"),
+            "REDIS_URL":  ("redis",  "url"),
+            "QDRANT_URL": ("qdrant", "url"),
+        }
+        for env_key, url in _url_map.items():
+            if url and not os.environ.get(env_key):
+                os.environ[env_key] = url
+            if url:
+                section, key = _cfg_map[env_key]
+                config.setdefault(section, {})[key] = url
 
     ollama_url   = config.get("ollama", {}).get("url", "http://localhost:11434")
     litellm_url  = config.get("litellm", {}).get("url", "http://localhost:4000")
