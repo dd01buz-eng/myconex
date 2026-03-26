@@ -317,7 +317,12 @@ class ServiceWatcher:
         logger.info("[watcher] service discovery started")
 
     async def stop(self) -> None:
-        """Stop all browsers."""
+        """Stop all browsers and cancel their background tasks."""
+        for browser in self._browsers:
+            try:
+                await browser.async_cancel()
+            except Exception:
+                pass
         self._browsers.clear()
         logger.info("[watcher] service discovery stopped")
 

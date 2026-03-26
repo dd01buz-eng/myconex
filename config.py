@@ -398,8 +398,6 @@ def apply_discovered_urls(cfg: "MyconexConfig", urls: "ServiceURLs") -> None:
       - The ServiceURLs field is not None (service was found)
       - No explicit user env var is set for that service (user config wins)
     """
-    from core.discovery.mesh_discovery import ServiceURLs  # avoid circular at module level
-
     if urls.nats_url and not os.environ.get("NATS_URL"):
         cfg.mesh.nats_url = urls.nats_url
     if urls.redis_url and not os.environ.get("REDIS_URL"):
