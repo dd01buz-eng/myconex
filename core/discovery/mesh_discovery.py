@@ -622,12 +622,8 @@ async def resolve_service_urls(
     await watcher.start()
 
     # Wait for mDNS results
-    await asyncio.sleep(min(timeout, 10.0))
-    _urls_result = watcher.get_urls()
-    if asyncio.iscoroutine(_urls_result):
-        discovered = await _urls_result
-    else:
-        discovered = _urls_result
+    await asyncio.sleep(timeout)
+    discovered = watcher.get_urls()
 
     def _resolve(env_key: str, mdns_url: Optional[str], label: str) -> str:
         # Priority 1: explicit user config (env var or .env, both land in os.environ)

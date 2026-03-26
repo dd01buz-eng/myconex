@@ -221,8 +221,8 @@ class TestResolveServiceUrls(unittest.TestCase):
                 with patch(
                     'core.discovery.mesh_discovery.ServiceWatcher'
                 ) as MockWatcher:
-                    mock_watcher = AsyncMock()
-                    mock_watcher.get_urls.return_value = ServiceURLs()  # empty — mDNS found nothing
+                    mock_watcher = MagicMock()
+                    mock_watcher.get_urls = MagicMock(return_value=ServiceURLs())  # empty — mDNS found nothing
                     mock_watcher.start = AsyncMock()
                     MockWatcher.return_value = mock_watcher
 
@@ -248,12 +248,12 @@ class TestResolveServiceUrls(unittest.TestCase):
                 with patch(
                     'core.discovery.mesh_discovery.ServiceWatcher'
                 ) as MockWatcher:
-                    mock_watcher = AsyncMock()
-                    mock_watcher.get_urls.return_value = ServiceURLs(
+                    mock_watcher = MagicMock()
+                    mock_watcher.get_urls = MagicMock(return_value=ServiceURLs(
                         nats_url="nats://hub:4222",
                         redis_url="redis://hub:6379",
                         qdrant_url="http://hub:6333",
-                    )
+                    ))
                     mock_watcher.start = AsyncMock()
                     MockWatcher.return_value = mock_watcher
 
@@ -277,8 +277,8 @@ class TestResolveServiceUrls(unittest.TestCase):
                 with patch(
                     'core.discovery.mesh_discovery.ServiceWatcher'
                 ) as MockWatcher:
-                    mock_watcher = AsyncMock()
-                    mock_watcher.get_urls.return_value = ServiceURLs()  # nothing found
+                    mock_watcher = MagicMock()
+                    mock_watcher.get_urls = MagicMock(return_value=ServiceURLs())  # nothing found
                     mock_watcher.start = AsyncMock()
                     MockWatcher.return_value = mock_watcher
 
@@ -305,8 +305,8 @@ class TestResolveServiceUrls(unittest.TestCase):
                 with patch(
                     'core.discovery.mesh_discovery.ServiceWatcher'
                 ) as MockWatcher:
-                    mock_watcher = AsyncMock()
-                    mock_watcher.get_urls.return_value = ServiceURLs()
+                    mock_watcher = MagicMock()
+                    mock_watcher.get_urls = MagicMock(return_value=ServiceURLs())
                     mock_watcher.start = AsyncMock()
                     MockWatcher.return_value = mock_watcher
 
