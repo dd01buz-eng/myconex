@@ -26,7 +26,7 @@ Built on Recursive Language Model (RLM) principles: the primary agent manages it
 │  │  └─────────┘ │                  │  └─────────┘ │               │
 │  └──────────────┘                  └──────────────┘               │
 │           ▲                                ▲                        │
-│           │         Redis (state)          │                        │
+│           │    Redis (state) · Qdrant (RAG)│                        │
 │           └───────────────────────────────┘                        │
 │                                                                     │
 │  ┌─────────────────────────────────────────┐                       │
@@ -35,10 +35,10 @@ Built on Recursive Language Model (RLM) principles: the primary agent manages it
 │  │  Data        │ DevOps   │ QA            │                       │
 │  └─────────────────────────────────────────┘                       │
 │                                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐             │
-│  │ Discord  │  │ REST API │  │  Autonomous Loop      │             │
-│  │ Gateway  │  │ :8765    │  │  (self-optimization)  │             │
-│  └──────────┘  └──────────┘  └──────────────────────┘             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────────┐ │
+│  │ Discord  │  │ REST API │  │Dashboard │  │  Autonomous Loop   │ │
+│  │ Gateway  │  │ :8765    │  │Watch Mode│  │  (self-optimize)   │ │
+│  └──────────┘  └──────────┘  └──────────┘  └────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,6 +76,7 @@ myconex/
 ├── __main__.py                    # Entry point (all modes)
 ├── main.py                        # Legacy worker/mesh node launcher
 ├── config.py                      # Unified configuration system
+├── buzlock_bot.py                 # Buzlock bot integration
 ├── CLAUDE.md                      # Claude Code behavioral rules
 ├── lessons.md                     # Self-improvement lesson log
 │
@@ -83,6 +84,7 @@ myconex/
 │   ├── agents/
 │   │   ├── base_agent.py          # BaseAgent + AgentRole + delegate()
 │   │   ├── rlm_agent.py           # RLMAgent — top-level orchestrator
+│   │   ├── hermes_agent.py        # Nous-Hermes GGUF agent wrapper
 │   │   └── context_manager.py     # ContextFrame, SessionMemory, PersistentMemory
 │   ├── workflows/
 │   │   └── task_router.py         # TaskRouter — agent lifecycle + routing
@@ -92,10 +94,30 @@ myconex/
 │   ├── gateway/
 │   │   ├── agentic_tools.py       # Tool registry + handlers
 │   │   ├── python_repl.py         # PersistentPythonREPL, REPLPool, CodebaseIndex
-│   │   └── discord_gateway.py     # Discord bot → RLMAgent wiring
+│   │   ├── discord_gateway.py     # Discord bot → RLMAgent wiring
+│   │   ├── api_gateway.py         # REST API gateway (:8765)
+│   │   ├── mesh_gateway.py        # Inter-node mesh communication
+│   │   ├── chat_history_retriever.py
+│   │   └── self_improvement.py    # Self-improvement pipeline
+│   ├── coordinator/
+│   │   └── orchestrator.py        # Mesh task lifecycle, node roles, topology
+│   ├── memory/
+│   │   └── vector_store.py        # Qdrant vector store / RAG
+│   ├── classifier/
+│   │   └── hardware.py            # Hardware detection → tier assignment
 │   ├── autonomous_loop.py         # 4-phase self-optimization loop
+│   ├── mcp_client.py              # MCP protocol client
+│   ├── self_healer.py             # Automatic fault recovery
+│   ├── novelty_scanner.py         # Novel signal detection
+│   ├── plugin_loader.py           # Dynamic plugin loading
+│   ├── metrics.py                 # Metrics collection
+│   ├── digest.py                  # Session digest generation
+│   ├── notifications.py           # Notification routing
 │   ├── discovery/                 # mDNS mesh discovery
 │   └── messaging/                 # NATS pub/sub client
+│
+├── dashboard/
+│   └── app.py                     # Web dashboard with Watch Mode
 │
 ├── tools/
 │   ├── sandbox_executor.py        # Resource-limited subprocess execution
@@ -104,9 +126,22 @@ myconex/
 │
 ├── integrations/
 │   ├── moe_hermes_integration.py  # HermesMoEAgent (MoE primary)
+│   ├── hermes_bridge.py           # Bridge to hermes-agent process
+│   ├── dlam_client.py             # DLAM integration
+│   ├── fabric_client.py           # Fabric AI integration
+│   ├── knowledge_store.py         # External knowledge store
+│   ├── rss_monitor.py             # RSS feed monitoring
+│   ├── signal_detector.py         # Signal/anomaly detection
+│   ├── gmail_reader.py            # Gmail ingestion
+│   ├── email_ingester.py          # Email ingestion pipeline
+│   ├── youtube_ingester.py        # YouTube transcript ingestion
+│   ├── podcast_ingester.py        # Podcast audio ingestion
 │   ├── flash-moe/                 # C/Metal flash-moe inference
 │   └── hermes-agent/              # Nous-Hermes GGUF agent
 │
+├── services/                      # Docker Compose: NATS, Redis, Qdrant, LiteLLM
+├── mobile/                        # Capacitor + Vite + Tailwind mobile scaffold
+├── api/                           # API server module
 └── tests/
     └── test_myconex.py            # Comprehensive test suite
 ```
@@ -170,6 +205,13 @@ python3 -m myconex --mode worker
 
 # Full stack (worker + api + discord)
 python3 -m myconex --mode full
+```
+
+### Docker (services)
+
+```bash
+cd services
+docker compose up -d   # starts NATS, Redis, Qdrant, LiteLLM
 ```
 
 ---
@@ -272,7 +314,8 @@ When run with `--mode autonomous`, MYCONEX performs a continuous 4-phase self-im
 
 - Audit log: `~/.myconex/audit.jsonl`
 - Metrics: `~/.myconex/metrics.json`
-- Lessons: `lessons.md` (project root)
+- Lessons: `lessons.md` (project root, injected into every system prompt)
+- Session digests: `~/.myconex/session_YYYYMMDD.md`
 - Reflection digest: every N cycles (configurable via `reflect_every_n`)
 
 ---
@@ -370,13 +413,27 @@ Test groups:
 
 ## Self-Improvement
 
-MYCONEX tracks its own behavioral lessons in `lessons.md`. After any correction or confirmed improvement, Claude Code appends a new rule — governed by `CLAUDE.md` at the project root.
+MYCONEX tracks its own behavioral lessons in `lessons.md`. Every lesson is injected into the system prompt at session start, so corrections carry forward automatically without fine-tuning.
 
 The self-improvement loop:
-1. Claude Code detects a correction or confirmed approach
-2. Identifies the class of issue (not just the instance)
+1. Detects a correction or confirmed improvement
+2. Identifies the *class* of issue (not just the instance)
 3. Writes a concise prevention rule to `lessons.md`
 4. Applies the rule immediately in the current session
+
+---
+
+## Documentation
+
+| Doc | Description |
+|-----|-------------|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System layers, component map, data flow |
+| [`docs/FEATURES.md`](docs/FEATURES.md) | All features with lifecycle tags |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Architectural decisions and rationale |
+| [`docs/MEMORY.md`](docs/MEMORY.md) | Runtime quirks and contributor gotchas |
+| [`docs/TODO.md`](docs/TODO.md) | Prioritized task backlog |
+| [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | Human-impact change history |
+| [`docs/DISCORD_SETUP.md`](docs/DISCORD_SETUP.md) | Discord bot portal setup guide |
 
 ---
 

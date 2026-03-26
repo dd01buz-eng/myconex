@@ -1,147 +1,43 @@
-# MYCONEX — Discord Bot Setup TODO
-
-**Discord Application ID:** `1469408384070586432`
-**Source reference:** `~/hermes-agent-repo/gateway/platforms/discord.py` (2085 lines)
-**Platform base:** `~/hermes-agent-repo/gateway/platforms/base.py` (1313 lines)
+# MYCONEX — TODO
 
 ---
 
-## Status
+## WIP
 
-- [x] MYCONEX core mesh system implemented (`main.py`, `core/`, `orchestration/`)
-- [x] Discord platform adapter exists in hermes-agent-repo (`gateway/platforms/discord.py`)
-- [x] Discord bot wired into MYCONEX (`core/gateway/discord_gateway.py`, `main.py`)
-- [x] `discord.py==2.7.1` added to `pyproject.toml` and installed
-- [x] `discord:` section added to `config/mesh_config.yaml`
-- [x] `.env` created with `DISCORD_APPLICATION_ID=1469408384070586432` (token placeholder)
+*(no active multi-session tasks)*
 
 ---
 
-## Phase 1 — Dependencies & Credentials ✓ DONE
+## High
 
-### 1.1 Add `discord.py` dependency ✓
-- `pyproject.toml` updated: `"discord.py>=2.7.0"`
-- Installed: `discord.py==2.7.1`
-- Intents verified: `message_content`, `members`, `voice_states` all OK
-
-### 1.2 Create `.env` file ✓
-Create `/home/techno-shaman/myconex/.env` with:
-```
-DISCORD_BOT_TOKEN=<your-bot-token-from-discord-dev-portal>
-DISCORD_APPLICATION_ID=1469408384070586432
-DISCORD_HOME_CHANNEL=<channel-id-for-default-delivery>
-DISCORD_HOME_CHANNEL_NAME=general
-DISCORD_ALLOWED_USERS=          # comma-separated user IDs; empty = allow all
-DISCORD_REQUIRE_MENTION=false   # true = bot only responds when @mentioned
-DISCORD_FREE_RESPONSE_CHANNELS= # channel IDs where bot responds without mention
-DISCORD_AUTO_THREAD=false       # true = create thread per conversation
-DISCORD_ALLOW_BOTS=none         # none | all | allowlist
-```
-
-**Where to get the bot token:**
-1. Go to https://discord.com/developers/applications/1469408384070586432
-2. Bot → Reset Token → copy
-3. Privileged Gateway Intents: enable **Message Content**, **Server Members**, **Presence** (if needed)
-
-### 1.3 Add `.env` to `.gitignore` ✓
-- Already present in `.gitignore` (was there before this session)
+- Wire `SandboxExecutor` resource limits for Windows (currently Linux/macOS only via `resource.setrlimit`)
+- Add quality-based fallback in MoE chain (not just availability-based)
+- Tune trivial-message RAG skip classifier to avoid dropping relevant short messages
 
 ---
 
-## Phase 2 — Integrate Discord Gateway into MYCONEX ✓ DONE
+## Medium
 
-### 2.1 Add Discord section to `config/mesh_config.yaml`
-```yaml
-# ─── Discord Bot ──────────────────────────────────────────────────────────────
-discord:
-  enabled: true
-  application_id: "1469408384070586432"
-  require_mention: false
-  auto_thread: false
-  free_response_channels: []   # list of channel IDs
-```
-
-### 2.2 Create `core/gateway/discord_gateway.py`
-- Copy/adapt `hermes-agent-repo/gateway/platforms/discord.py`
-- Strip hermes-specific imports (`hermes_cli`, `gateway.config`, `gateway.platforms.base`)
-- Replace with MYCONEX equivalents:
-  - `BasePlatformAdapter` → simple base class or inline
-  - `MessageEvent` → dataclass in MYCONEX
-  - Route received messages → `TaskRouter.route(task_type="chat", payload={...})`
-
-### 2.3 Update `main.py` — add Discord bot startup
-In `run_node()`, after the task router is started:
-```python
-# 3. Start Discord bot (if configured)
-discord_task = None
-if cfg.get("discord", {}).get("enabled"):
-    from core.gateway.discord_gateway import DiscordGateway
-    discord_gw = DiscordGateway(cfg, router)
-    discord_task = asyncio.create_task(discord_gw.start())
-```
-And in the shutdown block:
-```python
-if discord_task:
-    discord_task.cancel()
-```
-
-### 2.4 Add `--mode discord` CLI option (optional)
-- Extend the `mode` click option to include `"discord"` and `"full"` (mesh + discord)
+- Mobile app (`mobile/`) — Capacitor + Vite scaffold exists, not connected to backend
+- Flesh out `gmail_reader.py` / `email_ingester.py` (currently beta)
+- Add guild-level slash command sync option for faster Discord development iteration
+- Add `lessons.md` size monitor — warn when approaching context budget
+- Document `core/mcp_client.py` usage and supported MCP servers
 
 ---
 
-## Phase 3 — Discord Bot Portal Configuration ✓ DONE
+## Low
 
-See **`docs/DISCORD_SETUP.md`** for the full step-by-step guide.
-
-### 3.1 Register Slash Commands ✓
-Slash commands are auto-synced on `on_ready` — no manual step required.
-Registered commands: `/ask`, `/reset`, `/status`, `/tier`
-
-### 3.2 Discord Developer Portal Settings ✓ (documented)
-At https://discord.com/developers/applications/1469408384070586432:
-- **OAuth2 → Scopes:** `bot`, `applications.commands`
-- **Bot Permissions integer:** `414464683072` (Send Messages, Read History, Slash Commands, Embed Links, Attach Files, etc.)
-- **Privileged Intents:** `Message Content Intent` ✓, `Server Members Intent` ✓
-- **Invite URL:** `https://discord.com/oauth2/authorize?client_id=1469408384070586432&permissions=414464683072&scope=bot%20applications.commands`
-
-### Outstanding manual steps (requires human action)
-- [x] Go to Portal → Bot → **Reset Token** → paste into `.env`
-- [x] Enable **Message Content Intent** in Portal → Bot → Privileged Gateway Intents
-- [x] Enable **Server Members Intent** in Portal → Bot → Privileged Gateway Intents
-- [x] Use invite URL above to add the bot to your Discord server
+- Migrate `main.py` (legacy) users to `__main__.py` once systemd scripts are updated
+- Add `MYCONEX_DECOMPOSE_THRESHOLD` env var so complexity threshold is configurable without code changes
+- `podcast_ingester.py` and `youtube_ingester.py` — complete implementation (currently beta stubs)
 
 ---
 
-## Phase 4 — Testing
+## Long-term
 
-- [x] `python main.py status` — verify hardware/mesh detection works
-- [x] `python main.py --mode worker` — start without Discord, confirm no errors
-- [x] Set `DISCORD_BOT_TOKEN` in `.env` and run `python main.py --mode full`
-- [x] Verify bot appears Online in Discord server
-- [x] Verify slash commands appear (may take up to 1 hr for global sync; use guild sync for instant)
-- [x] Send a message / use `/ask` — verify response routes through `TaskRouter`
-- [x] Check logs for NATS connectivity (mesh messaging)
-
----
-
-## File Map
-
-| File | Status |
-|------|--------|
-| `pyproject.toml` | ✓ `discord.py>=2.7.0` added |
-| `.env` | ✓ Created — **token set** |
-| `.gitignore` | ✓ `.env` already excluded |
-| `config/mesh_config.yaml` | ✓ `discord:` section added |
-| `core/gateway/discord_gateway.py` | ✓ Created (310 lines) |
-| `main.py` | ✓ `DiscordGateway` wired into `run_node()`, `discord` mode added |
-| `docs/DISCORD_SETUP.md` | ✓ Created — full Portal configuration guide |
-| `docs/TODO.md` | ✓ This file |
-
----
-
-## Notes
-
-- The `hermes-agent-repo/gateway/platforms/discord.py` is the **reference implementation** — it handles voice, threads, slash commands, allowed-users lists, and bot filtering. Port only what MYCONEX needs.
-- MYCONEX's task routing (`T1/T2/T3/T4` tiers) should be the backend for Discord messages — Discord is just an input channel.
-- The bot's Intents required: `message_content=True`, `dm_messages=True`, `guild_messages=True`, `members=True`.
+- Container-grade sandboxing for `SandboxExecutor` (Docker/nsjail wrapping)
+- Quality-scoring feedback loop: record which MoE chain member produced the best result per task type
+- Multi-node mesh testing harness (current tests are single-node only)
+- Plugin marketplace / discovery for `core/plugin_loader.py`
+- Autonomous task generation quality — ensure self-generated tasks are useful, not circular
