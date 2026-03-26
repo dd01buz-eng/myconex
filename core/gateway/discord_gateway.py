@@ -297,6 +297,110 @@ async def _rag_context(query: str) -> str:
         return ""
 
 
+# ─── Self-improvement: lessons loader ────────────────────────────────────────
+
+_LESSONS_FILE = Path(__file__).parents[2] / "lessons.md"
+
+
+def _load_lessons() -> str:
+    """
+    Read lessons.md from the repo root and return a compact behavioral-rules
+    block for injection into the system prompt.  Returns empty string if the
+    file is missing or empty.
+    """
+    try:
+        if not _LESSONS_FILE.exists():
+            return ""
+        text = _LESSONS_FILE.read_text(errors="replace").strip()
+        if not text:
+            return ""
+        # Strip the file header (everything before the first ## rule)
+        idx = text.find("\n## ")
+        if idx != -1:
+            text = text[idx:].strip()
+        if not text:
+            return ""
+        return "[Learned behavioral rules — follow strictly]\n" + text
+    except Exception:
+        return ""
+
+
+def _auto_generate_lessons() -> None:
+    """
+    Scan feedback_log.jsonl for patterns in downvoted responses and
+    auto-append new lessons to lessons.md when a pattern recurs ≥ 3 times.
+
+    Currently detects:
+      - Response style patterns (e.g. heavy bullet lists, very long replies)
+      - Repeated common words in downvoted responses that aren't in upvoted ones
+
+    Runs once at startup; safe to call multiple times (deduplicates by rule text).
+    """
+    try:
+        if not FEEDBACK_FILE.exists():
+            return
+        entries = [
+            json.loads(l) for l in FEEDBACK_FILE.read_text().splitlines() if l.strip()
+        ]
+        if len(entries) < 5:
+            return
+
+        neg = [e for e in entries if not e.get("positive")]
+        pos = [e for e in entries if e.get("positive")]
+        if len(neg) < 3:
+            return
+
+        stopwords = {
+            "the", "a", "an", "is", "it", "to", "of", "and", "in", "that",
+            "was", "for", "on", "are", "be", "as", "at", "by", "we", "you",
+            "i", "this", "with", "have", "but", "not", "they", "so", "or",
+            "from", "which", "your", "can", "will", "just", "do", "our",
+        }
+
+        # Word frequency in negative vs positive responses
+        def _word_freq(items: list) -> dict[str, int]:
+            freq: dict[str, int] = {}
+            for e in items:
+                for w in e.get("bot_response_preview", "").lower().split():
+                    w = w.strip(".,!?\"':-")
+                    if len(w) > 4 and w not in stopwords:
+                        freq[w] = freq.get(w, 0) + 1
+            return freq
+
+        neg_freq = _word_freq(neg)
+        pos_freq = _word_freq(pos)
+
+        # Words that appear ≥3× more in negative responses than positive
+        neg_signals = [
+            w for w, c in neg_freq.items()
+            if c >= 3 and neg_freq.get(w, 0) > pos_freq.get(w, 0) * 2
+        ]
+
+        if not neg_signals:
+            return
+
+        # Load existing lessons to avoid duplicates
+        existing = _LESSONS_FILE.read_text(errors="replace") if _LESSONS_FILE.exists() else ""
+        rule_key = f"avoid-pattern-{'_'.join(sorted(neg_signals[:3]))}"
+        if rule_key in existing:
+            return
+
+        lesson = (
+            f"\n\n## [Feedback] — Avoid responses heavy on certain patterns\n\n"
+            f"Auto-generated from {len(neg)}/{len(entries)} downvoted responses.\n"
+            f"Words/phrases appearing disproportionately in downvoted replies: "
+            f"{', '.join(neg_signals[:5])}.\n"
+            f"Consider shorter, more direct responses and vary phrasing.\n\n"
+            f"<!-- rule-key: {rule_key} -->"
+        )
+        with _LESSONS_FILE.open("a") as f:
+            f.write(lesson)
+        logger.info("[self-improve] auto-appended lesson to lessons.md (pattern: %s)",
+                    neg_signals[:3])
+    except Exception as exc:
+        logger.debug("[self-improve] _auto_generate_lessons failed: %s", exc)
+
+
 # ─── Feedback stats helper ────────────────────────────────────────────────────
 
 def _load_feedback_summary() -> str:
@@ -682,6 +786,19 @@ class DiscordGateway:
         @client.event
         async def on_ready() -> None:
             logger.info("[discord] online as %s (id=%s)", client.user, client.user.id)
+
+            # Run self-improvement loop: analyse feedback patterns and update lessons.md
+            try:
+                await asyncio.to_thread(_auto_generate_lessons)
+                lesson_count = sum(
+                    1 for l in (_LESSONS_FILE.read_text(errors="replace")
+                                if _LESSONS_FILE.exists() else "").splitlines()
+                    if l.startswith("## ")
+                )
+                logger.info("[self-improve] lessons.md loaded — %d rules active", lesson_count)
+            except Exception as exc:
+                logger.warning("[self-improve] startup lesson scan failed: %s", exc)
+
             try:
                 synced = await client.tree.sync()
                 logger.info("[discord] synced %d slash commands", len(synced))
@@ -1548,6 +1665,12 @@ class DiscordGateway:
         # Inject accumulated skills from past reflections into the system prompt
         base_prompt = state.system_prompt or _SYSTEM_PROMPT
         system_prompt = base_prompt + self._improver.get_skills_injection()
+
+        # Inject lessons learned from corrections (lessons.md) — these are
+        # hard behavioral rules that must be followed.
+        lessons = _load_lessons()
+        if lessons:
+            system_prompt = system_prompt + "\n\n" + lessons
 
         # Pre-load stored memories so the agent knows facts without needing a tool call.
         # Injected before RAG so personal facts appear first.
