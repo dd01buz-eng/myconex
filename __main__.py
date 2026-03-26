@@ -143,7 +143,13 @@ async def _discover_services(verbose: bool = False) -> tuple[Optional[Any], Opti
 
     try:
         cfg = load_config()
-        zc = AsyncZeroconf()
+        try:
+            zc = AsyncZeroconf()
+        except OSError as e:
+            # On Windows, port 5353 may be held by the DNS Client service.
+            # Discovery won't work but the rest of the app can still start.
+            logger.warning(f"[discovery] mDNS socket unavailable ({e}); falling back to .env config")
+            return None, None, None
 
         # Advertise local services (hub nodes will register; worker nodes probe nothing)
         advertiser = ServiceAdvertiser(zc=zc, node_name=cfg.mesh.node_name or "node", cfg=cfg)

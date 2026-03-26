@@ -273,7 +273,9 @@ class _ServiceBrowseListener:
             return
         try:
             info = ServiceInfo(type_, name)
-            if not info.request(zc, timeout=3000):
+            loop = asyncio.get_running_loop()
+            found = await loop.run_in_executor(None, lambda: info.request(zc, timeout=3000))
+            if not found:
                 return
             addresses = info.parsed_addresses()
             if not addresses:
