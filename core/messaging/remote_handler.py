@@ -97,6 +97,22 @@ class NATSRemoteHandler:
         # Exo consensus requests from peer nodes
         await self._client.subscribe("mesh.exo.consensus_request", self._on_exo_consensus)
 
+        # Specialist tier queue (set by build_specialist_handler)
+        _tier_queue = getattr(self, "_tier_queue", None)
+        if _tier_queue:
+            from core.messaging.nats_client import subject_tier
+            _tier = _tier_queue.replace("-workers", "").upper()
+            await self._client.subscribe(subject_tier(_tier), self._on_task, queue=_tier_queue)
+            logger.info("[nats-handler] subscribed to tier %s queue=%s", _tier, _tier_queue)
+
+        # Publish roster entry so peers know this node's capabilities
+        try:
+            from core.agents.specialist import SpecialistRegistry
+            roster = SpecialistRegistry().to_roster_entry()
+            await self._client.publish("mesh.roster", {"type": "roster", **roster})
+        except Exception:
+            pass
+
         logger.info("[nats-handler] subscribed — listening for mesh tasks")
 
         # Keep alive until stop() is called
@@ -244,6 +260,7 @@ class NATSRemoteHandler:
 
     async def _run_llm(self, prompt: str) -> str:
         """Run prompt through Ollama and return the response text."""
+        system = getattr(self, "_specialist_system_prompt", None) or _SYSTEM_PROMPT
         try:
             response = await self._http.post(
                 f"{self.ollama_url}/api/chat",
@@ -251,7 +268,7 @@ class NATSRemoteHandler:
                     "model":  self.model,
                     "stream": False,
                     "messages": [
-                        {"role": "system",  "content": _SYSTEM_PROMPT},
+                        {"role": "system",  "content": system},
                         {"role": "user",    "content": prompt},
                     ],
                 },

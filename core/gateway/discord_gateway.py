@@ -1010,6 +1010,18 @@ class DiscordGateway:
             except Exception as exc:
                 logger.debug("[discord] could not start digest scheduler: %s", exc)
 
+            # ── Morning briefing scheduler ────────────────────────────────────
+            try:
+                from core.briefing import MorningBriefing
+                briefing = MorningBriefing(_post_digest)
+                asyncio.create_task(briefing.run_forever())
+                logger.info(
+                    "[discord] morning briefing scheduler started — hour=%d",
+                    int(os.getenv("BRIEFING_HOUR", "8")),
+                )
+            except Exception as exc:
+                logger.debug("[discord] could not start morning briefing: %s", exc)
+
         @client.event
         async def on_message(message: discord.Message) -> None:
             if message.author == client.user:
@@ -1078,6 +1090,19 @@ class DiscordGateway:
                     "[discord] feedback %s on msg %s from user %s",
                     str(payload.emoji), payload.message_id, payload.user_id,
                 )
+
+                # RAG repair: record gap when a downvoted response had weak RAG context
+                if not entry["positive"] and _last_query:
+                    try:
+                        from core.rag_repair import record_rag_miss
+                        record_rag_miss(
+                            query=_last_query,
+                            response=entry["bot_response_preview"],
+                            rag_hit_count=0,   # conservative — we don't track per-message
+                            max_rag_score=0.0,
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.debug("[discord] reaction handler error: %s", exc)
 
@@ -1439,6 +1464,34 @@ class DiscordGateway:
             except Exception as exc:
                 await interaction.followup.send(f"⚠️ Digest error: {exc}", ephemeral=True)
 
+        @tree.command(name="gaps", description="Show knowledge gaps — queries that lacked good RAG context")
+        async def slash_gaps(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            try:
+                from core.rag_repair import get_open_gaps, get_gap_topics
+                gaps = get_open_gaps()
+                if not gaps:
+                    await interaction.followup.send("✅ No open knowledge gaps recorded yet.", ephemeral=True)
+                    return
+                embed = discord.Embed(
+                    title=f"⚠️ Knowledge Gaps ({len(gaps)} open)",
+                    color=0xFF6B35,
+                    description="Queries that got 👎 and lacked good RAG context. Add relevant content to fill these gaps.",
+                )
+                for g in gaps[:8]:
+                    score_str = f"best match: {g['max_rag_score']}" if g.get("max_rag_score") else "no RAG hit"
+                    embed.add_field(
+                        name=g["query"][:80],
+                        value=f"{score_str} · {g.get('recorded_at','')[:10]}",
+                        inline=False,
+                    )
+                topics = get_gap_topics()
+                if topics:
+                    embed.set_footer(text="Gap topics: " + ", ".join(topics[:8]))
+                await interaction.followup.send(embed=embed)
+            except Exception as exc:
+                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
         @tree.command(name="feedback", description="Show 👍/👎 feedback stats for Buzlock responses")
         async def slash_feedback(interaction: discord.Interaction) -> None:
             try:
@@ -1786,6 +1839,21 @@ class DiscordGateway:
         if vision_context:
             user_message = f"{user_message}\n\n{vision_context}".strip()
 
+        # ── Voice: transcribe audio attachments (Whisper) ─────────────────────
+        if attachment_urls:
+            try:
+                from core.gateway.voice_io import transcribe_attachment_urls, format_transcription_context
+                transcriptions = await transcribe_attachment_urls(list(attachment_urls))
+                voice_ctx = format_transcription_context(transcriptions)
+                if voice_ctx:
+                    user_message = f"{user_message}\n\n{voice_ctx}".strip()
+                    logger.info(
+                        "[discord] voice: transcribed %d audio file(s) for %s",
+                        len(transcriptions), key,
+                    )
+            except Exception as _ve:
+                logger.debug("[discord] voice transcription failed: %s", _ve)
+
         # Inject accumulated skills from past reflections into the system prompt
         base_prompt = state.system_prompt or _SYSTEM_PROMPT
         system_prompt = base_prompt + self._improver.get_skills_injection()
@@ -1801,6 +1869,34 @@ class DiscordGateway:
         mem_ctx = _load_memory_for_prompt()
         if mem_ctx:
             system_prompt = system_prompt + "\n\n" + mem_ctx
+
+        # Inject knowledge graph context for named entities in the query
+        try:
+            from core.knowledge_graph import get_graph as _get_kg
+            _kg_ctx = _get_kg().context_for(content)
+            if _kg_ctx:
+                system_prompt = system_prompt + "\n\n" + _kg_ctx
+        except Exception:
+            pass
+
+        # Inject memory distillations (weekly higher-level patterns)
+        try:
+            from core.memory.distiller import get_distillation_context
+            _distill_ctx = get_distillation_context()
+            if _distill_ctx:
+                system_prompt = system_prompt + "\n\n" + _distill_ctx
+        except Exception:
+            pass
+
+        # Inject upcoming calendar events so agent is time-aware
+        try:
+            from integrations.calendar_ingester import get_upcoming_events, get_events_context
+            _cal_events = await get_upcoming_events(lookahead_hours=12)
+            _cal_ctx = get_events_context(_cal_events)
+            if _cal_ctx:
+                system_prompt = system_prompt + "\n\n" + _cal_ctx
+        except Exception:
+            pass
 
         # Auto-RAG: prepend relevant knowledge base context
         rag_block = await _rag_context(content)

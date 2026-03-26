@@ -456,6 +456,18 @@ class RSSMonitor:
                 fabric_result.get("raw", {}).get("extract_wisdom")
                 or fabric_result.get("raw", {}).get("summarize", "")
             )
+
+            # Knowledge graph extraction
+            if wisdom_text:
+                try:
+                    from core.knowledge_graph import ingest_text as _kg_ingest
+                    asyncio.ensure_future(_kg_ingest(
+                        wisdom_text[:1500], source="rss",
+                        title=article.get("title", ""),
+                    ))
+                except Exception:
+                    pass
+
             embed_item = None
             if wisdom_text:
                 embed_item = {

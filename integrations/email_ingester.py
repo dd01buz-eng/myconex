@@ -441,6 +441,20 @@ class EmailIngester:
                 )
                 _save_wisdom_entry(email_dict, fabric_result)
 
+            # Knowledge graph extraction
+            _kg_text = (fabric_result.get("raw", {}).get("extract_wisdom")
+                        or fabric_result.get("raw", {}).get("summarize")
+                        or email_dict.get("body", ""))[:1500]
+            if _kg_text:
+                try:
+                    from core.knowledge_graph import ingest_text as _kg_ingest
+                    asyncio.create_task(_kg_ingest(
+                        _kg_text, source="email",
+                        title=email_dict.get("subject", ""),
+                    ))
+                except Exception:
+                    pass
+
             # Queue wisdom for batch embedding after the loop
             wisdom_text = (fabric_result.get("raw", {}).get("extract_wisdom")
                            or fabric_result.get("raw", {}).get("summarize", ""))

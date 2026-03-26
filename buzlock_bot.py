@@ -204,6 +204,28 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Could not start signal detector: %s", exc)
 
+    # 6l. Start plugin loader with hot-reload watcher
+    plugin_loader = None
+    try:
+        from core.plugin_loader import PluginLoader
+        _plugins_dir = PROJECT_ROOT / "plugins"
+        _plugins_dir.mkdir(exist_ok=True)
+        plugin_loader = PluginLoader(plugin_dir=str(_plugins_dir), hot_reload=True)
+        loaded = await plugin_loader.load_all()
+        logger.info("Plugin loader started — %d plugin(s) loaded, hot-reload active", len(loaded))
+    except Exception as exc:
+        logger.warning("Could not start plugin loader: %s", exc)
+
+    # 6k. Start memory distiller (weekly higher-level abstraction)
+    distiller_task = None
+    try:
+        from core.memory.distiller import MemoryDistiller
+        distiller = MemoryDistiller()
+        distiller_task = asyncio.create_task(_supervise("distiller", distiller.run_forever))
+        logger.info("Memory distiller started — interval=%sd", os.getenv("DISTILLER_INTERVAL_DAYS", "7"))
+    except Exception as exc:
+        logger.warning("Could not start memory distiller: %s", exc)
+
     # 6j. Start exo pool consensus loop (distributed inference, consensus-gated)
     exo_task = None
     try:
@@ -256,6 +278,19 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("Could not start dashboard: %s", exc)
 
+    # 6m. Start Telegram bridge (NATS-to-Telegram notification forwarding)
+    telegram_task = None
+    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+        try:
+            from integrations.telegram_bridge import TelegramBridge
+            telegram_bridge = TelegramBridge()
+            telegram_task = asyncio.create_task(_supervise("telegram_bridge", telegram_bridge.run_forever))
+            logger.info("Telegram bridge started — chat_id=%s", os.getenv("TELEGRAM_CHAT_ID"))
+        except Exception as exc:
+            logger.warning("Could not start Telegram bridge: %s", exc)
+    else:
+        logger.info("Telegram bridge skipped — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to enable")
+
     # 7. Wait for shutdown signal
     await stop_event.wait()
 
@@ -295,6 +330,13 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
 
+    if distiller_task:
+        distiller_task.cancel()
+        try:
+            await distiller_task
+        except asyncio.CancelledError:
+            pass
+
     if exo_task:
         exo_task.cancel()
         try:
@@ -321,6 +363,19 @@ async def main() -> None:
         try:
             await dashboard_task
         except asyncio.CancelledError:
+            pass
+
+    if telegram_task:
+        telegram_task.cancel()
+        try:
+            await telegram_task
+        except asyncio.CancelledError:
+            pass
+
+    if plugin_loader:
+        try:
+            await plugin_loader.teardown_all()
+        except Exception:
             pass
 
     logger.info("Stopping %s gateway...", BOT_PERSONA)
