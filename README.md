@@ -168,6 +168,15 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Configure
+
+```bash
+cp .env.example .env
+# Edit .env and fill in your values
+```
+
+At minimum you need `DISCORD_BOT_TOKEN` for Discord mode. Everything else has sensible defaults. See [`.env.example`](.env.example) for the full list of options.
+
 ### Run (CLI mode)
 
 ```bash
@@ -457,6 +466,7 @@ For the full walkthrough — permissions integers, guild sync, troubleshooting, 
 | [`docs/TODO.md`](docs/TODO.md) | Prioritized task backlog |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | Human-impact change history |
 | [`docs/DISCORD_SETUP.md`](docs/DISCORD_SETUP.md) | Discord bot portal setup guide |
+| [`.env.example`](.env.example) | All environment variables with descriptions |
 
 ---
 
