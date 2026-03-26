@@ -204,6 +204,44 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Could not start signal detector: %s", exc)
 
+    # 6j. Start exo pool consensus loop (distributed inference, consensus-gated)
+    exo_task = None
+    try:
+        from core.exo_pool import get_pool as _get_exo_pool
+        exo_pool = _get_exo_pool()
+        exo_task = asyncio.create_task(_supervise("exo_pool", exo_pool.run_consensus_loop))
+        logger.info(
+            "Exo pool started — endpoint=%s threshold=%.2f quorum=%d",
+            os.getenv("EXO_BASE_URL", "http://localhost:52415/v1"),
+            float(os.getenv("EXO_COMPLEXITY_THRESHOLD", "0.85")),
+            int(os.getenv("EXO_MIN_CONSENSUS_NODES", "2")),
+        )
+    except Exception as exc:
+        logger.warning("Could not start exo pool: %s", exc)
+
+    # 6i. Start memory consolidator (TTL pruning + near-dup removal)
+    consolidator_task = None
+    try:
+        from core.memory.consolidator import MemoryConsolidator
+        consolidator = MemoryConsolidator()
+        consolidator_task = asyncio.create_task(_supervise("consolidator", consolidator.run_forever))
+        logger.info("Memory consolidator started — interval=%sh", os.getenv("CONSOLIDATOR_INTERVAL_HOURS", "24"))
+    except Exception as exc:
+        logger.warning("Could not start memory consolidator: %s", exc)
+
+    # 6h. Start NATS remote handler (mesh task receiver)
+    nats_task = None
+    if os.getenv("NATS_URL"):
+        try:
+            from core.messaging.remote_handler import NATSRemoteHandler
+            nats_handler = NATSRemoteHandler()
+            nats_task = asyncio.create_task(_supervise("nats_handler", nats_handler.run_forever))
+            logger.info("NATS remote handler started — url=%s", os.getenv("NATS_URL"))
+        except Exception as exc:
+            logger.warning("Could not start NATS remote handler: %s", exc)
+    else:
+        logger.info("NATS remote handler skipped — NATS_URL not set")
+
     # 6g. Start web dashboard
     dashboard_task = None
     _dashboard_port = int(os.getenv("DASHBOARD_PORT", "7860"))
@@ -254,6 +292,27 @@ async def main() -> None:
         signal_task.cancel()
         try:
             await signal_task
+        except asyncio.CancelledError:
+            pass
+
+    if exo_task:
+        exo_task.cancel()
+        try:
+            await exo_task
+        except asyncio.CancelledError:
+            pass
+
+    if consolidator_task:
+        consolidator_task.cancel()
+        try:
+            await consolidator_task
+        except asyncio.CancelledError:
+            pass
+
+    if nats_task:
+        nats_task.cancel()
+        try:
+            await nats_task
         except asyncio.CancelledError:
             pass
 

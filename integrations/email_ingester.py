@@ -423,6 +423,7 @@ class EmailIngester:
         # Load existing insights list
         insights_log: list[dict] = _load_json(_INSIGHTS_FILE, [])
         processed = 0
+        embed_queue: list[dict] = []  # collected for batch embedding after the loop
 
         for email_dict in new_emails:
             uid = email_dict["uid"]
@@ -440,24 +441,20 @@ class EmailIngester:
                 )
                 _save_wisdom_entry(email_dict, fabric_result)
 
-            # Embed wisdom into Qdrant knowledge base
+            # Queue wisdom for batch embedding after the loop
             wisdom_text = (fabric_result.get("raw", {}).get("extract_wisdom")
                            or fabric_result.get("raw", {}).get("summarize", ""))
             if wisdom_text:
-                try:
-                    from integrations.knowledge_store import embed_and_store
-                    await embed_and_store(
-                        text=wisdom_text,
-                        source="email",
-                        metadata={
-                            "subject": email_dict.get("subject", ""),
-                            "from":    email_dict.get("from", ""),
-                            "date":    email_dict.get("date", ""),
-                            "uid":     uid,
-                        },
-                    )
-                except Exception as exc:
-                    logger.debug("[email_ingester] Qdrant embed skipped: %s", exc)
+                embed_queue.append({
+                    "text":   wisdom_text,
+                    "source": "email",
+                    "metadata": {
+                        "subject": email_dict.get("subject", ""),
+                        "from":    email_dict.get("from", ""),
+                        "date":    email_dict.get("date", ""),
+                        "uid":     uid,
+                    },
+                })
 
             # Pass 2 — Structured JSON extraction via Ollama (profile fields)
             insights = await _extract_insights(email_dict)
@@ -493,6 +490,15 @@ class EmailIngester:
             insights_log.append(entry)
             seen.add(uid)
             processed += 1
+
+        # Batch embed all queued wisdom texts in one Ollama call
+        if embed_queue:
+            try:
+                from integrations.knowledge_store import embed_and_store_batch
+                await embed_and_store_batch(embed_queue)
+                logger.info("[email_ingester] batch-embedded %d wisdom item(s)", len(embed_queue))
+            except Exception as exc:
+                logger.debug("[email_ingester] Qdrant batch embed skipped: %s", exc)
 
         # Persist
         _save_json(_INSIGHTS_FILE, insights_log)

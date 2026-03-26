@@ -419,6 +419,37 @@ class HermesMoEAgent(InferenceAgent):
             task_type, complexity, _HERMES_AVAILABLE, self._moe.flash_moe.available,
         )
 
+        # ── 0. Exo distributed cluster (consensus-gated, high-complexity only) ──
+        try:
+            from core.exo_pool import get_pool as _get_exo_pool
+            _exo = _get_exo_pool()
+            if _exo.is_ready(complexity):
+                base_url, exo_model = _exo.endpoint()
+                exo_expert = ExpertConfig(
+                    name="exo-cluster",
+                    model=exo_model,
+                    base_url=base_url,
+                    api_key_env="",          # exo needs no key
+                    task_types=["inference", "generate", "code", "chat",
+                                "ask", "summarize", "search", "classify"],
+                    min_complexity=0.0,
+                    max_complexity=1.0,
+                )
+                try:
+                    result = await self._call_expert_api(
+                        messages, exo_expert, temperature, max_tokens
+                    )
+                    if result:
+                        logger.info(
+                            "[moe] served by exo-cluster (%s) complexity=%.2f nodes=%s",
+                            exo_model, complexity, _exo._contributing_nodes,
+                        )
+                        return result
+                except Exception as exc:
+                    logger.warning("[moe] exo-cluster failed (%s); continuing chain", exc)
+        except ImportError:
+            pass
+
         # ── 1. flash-moe local binary (macOS only) ────────────────────────────
         if self._moe.flash_moe.available:
             try:

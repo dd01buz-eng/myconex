@@ -39,6 +39,7 @@ _YT_FILE        = _BASE / "youtube_insights.json"
 _RSS_FILE       = _BASE / "rss_insights.json"
 _PODCAST_FILE   = _BASE / "podcast_insights.json"
 _DIGEST_STAMP   = _BASE / "last_digest.txt"  # ISO timestamp of last sent digest
+_SIGNALS_FILE   = _BASE / "signals_log.json"
 
 # Post on Sunday at this UTC hour (inclusive window: hour N to N+1)
 DIGEST_DAY  = int(os.getenv("DIGEST_DAY",  "6"))   # 0=Mon … 6=Sun
@@ -122,6 +123,21 @@ def build_digest_data(days: int = 7) -> dict[str, Any]:
         if len(quotes) >= 3:
             break
 
+    # Cross-source signals detected within the window
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    all_signals = _load(_SIGNALS_FILE, [])
+    recent_signals = [
+        s for s in all_signals
+        if s.get("detected_at", "") >= cutoff
+    ]
+    # De-dup by topic, keep most recent per topic
+    seen_topics: dict[str, dict] = {}
+    for s in recent_signals:
+        t = s.get("topic", "")
+        if t not in seen_topics or s["detected_at"] > seen_topics[t]["detected_at"]:
+            seen_topics[t] = s
+    signals = sorted(seen_topics.values(), key=lambda s: s["detected_at"], reverse=True)[:8]
+
     # Feedback stats
     fb_total = len(feedback)
     fb_pos   = sum(1 for f in feedback if f.get("positive"))
@@ -139,6 +155,7 @@ def build_digest_data(days: int = 7) -> dict[str, Any]:
         "top_topics":     top_topics,
         "ideas":          ideas,
         "quotes":         quotes,
+        "signals":        signals,
         "email_recent":   len(email_recent),
         "yt_recent":      len(yt_recent),
         "rss_recent":     len(rss_recent),
@@ -182,6 +199,12 @@ def build_digest_text(days: int = 7) -> str:
         for quote, src in d["quotes"]:
             src_str = f"  — {src}" if src else ""
             lines.append(f'   "{quote}"{src_str}')
+        lines.append("")
+    if d["signals"]:
+        lines += ["🔔 Cross-source signals:"]
+        for s in d["signals"]:
+            src_str = " + ".join(s.get("sources", []))
+            lines.append(f"   • {s['topic']}  [{src_str}]")
         lines.append("")
     if d["fb_total"]:
         rate_str = f" ({d['fb_rate']}% positive)" if d["fb_rate"] is not None else ""
@@ -250,6 +273,19 @@ def build_digest_embed(days: int = 7) -> dict[str, Any]:
         fields.append({
             "name": "✨ Standout wisdom",
             "value": "\n\n".join(q_lines),
+            "inline": False,
+        })
+
+    # Cross-source signals
+    if d["signals"]:
+        _EMOJI = {"email": "📧", "youtube": "📺", "rss": "📰", "podcast": "🎙️"}
+        sig_lines = []
+        for s in d["signals"]:
+            src_icons = " + ".join(_EMOJI.get(src, "📌") + src for src in s.get("sources", []))
+            sig_lines.append(f"**{s['topic']}** — {src_icons}")
+        fields.append({
+            "name": "🔔 Cross-source signals",
+            "value": "\n".join(sig_lines),
             "inline": False,
         })
 

@@ -295,10 +295,66 @@ def _rag_is_trivial(query: str) -> bool:
     return False
 
 
+_HYDE_OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://localhost:11434")
+_HYDE_MODEL       = os.getenv("HYDE_MODEL", os.getenv("NATS_LLM_MODEL", "llama3"))
+_HYDE_TIMEOUT     = float(os.getenv("HYDE_TIMEOUT_S", "6"))
+_HYDE_ENABLED     = os.getenv("HYDE_ENABLED", "true").lower() != "false"
+_HYDE_PROMPT      = (
+    "Write a short passage (2-4 sentences) that directly answers the following "
+    "question. Use concrete terms and domain-specific vocabulary. Do not say "
+    "'I' or explain that you're generating a hypothetical — just write the answer passage.\n"
+    "Question: {query}"
+)
+
+
+async def _hyde_expand(query: str) -> list[float] | None:
+    """
+    HyDE: generate a hypothetical answer to the query, embed it, and return
+    the embedding.  Falls back to None on any error so the caller can use
+    the plain query embedding instead.
+    """
+    if not _HYDE_ENABLED:
+        return None
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=_HYDE_TIMEOUT) as hc:
+            resp = await hc.post(
+                f"{_HYDE_OLLAMA_URL}/api/generate",
+                json={
+                    "model":  _HYDE_MODEL,
+                    "prompt": _HYDE_PROMPT.format(query=query),
+                    "stream": False,
+                    "options": {"num_predict": 120, "temperature": 0.3},
+                },
+            )
+            resp.raise_for_status()
+            hypothesis = resp.json().get("response", "").strip()
+
+        if not hypothesis:
+            return None
+
+        logger.debug("[discord] HyDE hypothesis: %r", hypothesis[:80])
+
+        from integrations.knowledge_store import _init, _embedder
+        if not await _init():
+            return None
+        embedding = await _embedder.generate_embedding(hypothesis[:1000])
+        return embedding
+
+    except Exception as exc:
+        logger.debug("[discord] HyDE expand failed (%s) — falling back to direct embed", exc)
+        return None
+
+
 async def _rag_context(query: str) -> str:
     """
     Query the Qdrant knowledge base with the user's message and return a
     formatted context block (empty string if unavailable or no results).
+
+    Uses HyDE (Hypothetical Document Embeddings): generates a short
+    hypothetical answer to the query, embeds that, and uses the resulting
+    vector for retrieval.  Falls back to direct query embedding on any error.
+
     Skips the query entirely for trivial / short messages to save ~350ms.
     """
     if not query or not query.strip():
@@ -308,7 +364,23 @@ async def _rag_context(query: str) -> str:
         return ""
     try:
         from integrations.knowledge_store import search
-        results = await search(query, limit=RAG_RESULTS, score_threshold=0.40)
+
+        # Try HyDE first; fall back to plain query embedding on failure
+        hyde_embedding = await _hyde_expand(query)
+        if hyde_embedding is not None:
+            results = await search(
+                query,
+                limit=RAG_RESULTS,
+                score_threshold=0.38,
+                query_embedding=hyde_embedding,
+            )
+            if not results:
+                # HyDE hypothesis may have been off — retry with plain embedding
+                logger.debug("[discord] HyDE returned 0 results, retrying with direct embed")
+                results = await search(query, limit=RAG_RESULTS, score_threshold=0.38)
+        else:
+            results = await search(query, limit=RAG_RESULTS, score_threshold=0.40)
+
         if not results:
             return ""
         parts = ["[Relevant knowledge from your personal knowledge base:]\n"]
@@ -1689,11 +1761,30 @@ class DiscordGateway:
         else:
             state.tool_cb = None
 
+        # ── Vision: describe image attachments before the main LLM call ─────
+        vision_context = ""
+        if attachment_urls:
+            try:
+                from core.gateway.vision import describe_attachments, format_vision_context
+                descriptions = await describe_attachments(list(attachment_urls))
+                vision_context = format_vision_context(descriptions)
+                if vision_context:
+                    logger.info(
+                        "[discord] vision: described %d image(s) for %s",
+                        len(descriptions), key,
+                    )
+            except Exception as _ve:
+                logger.debug("[discord] vision analysis failed: %s", _ve)
+
         # Append attachment URLs so the agent can act on them
         user_message = content
         if attachment_urls:
             urls = "\n".join(f"  • {u}" for u in attachment_urls)
             user_message = f"{content}\n\n[Attached files/images]\n{urls}".strip()
+
+        # Inject vision descriptions (after URL list so agent sees both)
+        if vision_context:
+            user_message = f"{user_message}\n\n{vision_context}".strip()
 
         # Inject accumulated skills from past reflections into the system prompt
         base_prompt = state.system_prompt or _SYSTEM_PROMPT
@@ -1721,6 +1812,26 @@ class DiscordGateway:
         if fb_summary:
             system_prompt = system_prompt + "\n" + fb_summary
 
+        # ── Semantic inference cache — check before hitting the LLM ──────────
+        _cache_eligible = False
+        try:
+            from core.inference_cache import is_cacheable, get as cache_get, put as cache_put, has_tool_calls
+            _model = self._resolve_runtime()[2]
+            _cache_eligible = is_cacheable(content, list(state.history), attachment_urls)
+            if _cache_eligible:
+                cached = await cache_get(content, _model)
+                if cached:
+                    logger.info("[cache] serving cached response for %r", content[:60])
+                    if streamer:
+                        # Feed cached text through streamer so UI looks live
+                        streamer.on_delta(cached)
+                        streamer._push()
+                    return {"final_response": cached, "messages": [], "from_cache": True}
+        except Exception as _ce:
+            logger.debug("[cache] lookup error: %s", _ce)
+            _cache_eligible = False
+        # ─────────────────────────────────────────────────────────────────────
+
         result: Dict[str, Any] = await asyncio.to_thread(
             agent.run_conversation,
             user_message=user_message,
@@ -1741,6 +1852,16 @@ class DiscordGateway:
         if messages:
             state.history = _trim_history_to_turns(messages, MAX_HISTORY_TURNS)
             _history_save(key, state.history)
+
+        # ── Store result in cache if eligible and no tool calls were used ────
+        if _cache_eligible:
+            try:
+                response_text = result.get("final_response", "")
+                if response_text and not has_tool_calls(messages):
+                    asyncio.create_task(cache_put(content, _model, response_text))
+            except Exception as _ce:
+                logger.debug("[cache] put error: %s", _ce)
+        # ─────────────────────────────────────────────────────────────────────
 
         # Record conversation for self-improvement; trigger reflection if due
         self._improver.record_conversation(messages)

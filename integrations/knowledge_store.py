@@ -105,20 +105,84 @@ async def embed_and_store(
         return None
 
 
+async def embed_and_store_batch(
+    items: list[dict[str, Any]],
+) -> list[str | None]:
+    """
+    Embed and store multiple items in a single Ollama batch call.
+
+    Each item dict must have:
+        text        (str)  — content to embed
+        source      (str)  — "email", "rss", "youtube", "podcast", "manual"
+        metadata    (dict) — extra fields (optional)
+        memory_type (str)  — Qdrant tag (optional, default "knowledge")
+
+    Returns list of stored IDs (or None for each failed item).
+    """
+    if not items:
+        return []
+    if not await _init():
+        return [None] * len(items)
+
+    from core.memory.vector_store import MemoryEntry
+
+    # Filter out empty texts but track original positions
+    valid: list[tuple[int, dict[str, Any]]] = [
+        (i, it) for i, it in enumerate(items) if it.get("text", "").strip()
+    ]
+    if not valid:
+        return [None] * len(items)
+
+    texts = [it["text"][:2000] for _, it in valid]
+    try:
+        embeddings = await _embedder.generate_embeddings(texts)
+    except Exception as exc:
+        logger.warning("[knowledge_store] batch embed failed: %s", exc)
+        return [None] * len(items)
+
+    results: list[str | None] = [None] * len(items)
+    store_tasks = []
+    for (orig_idx, it), embedding in zip(valid, embeddings):
+        entry = MemoryEntry(
+            id=str(uuid.uuid4()),
+            content=it["text"][:4000],
+            embedding=embedding,
+            metadata={**(it.get("metadata") or {}), "source": it["source"]},
+            agent_name="buzlock",
+            memory_type=it.get("memory_type", "knowledge"),
+        )
+        store_tasks.append((orig_idx, _store.store_memory(entry)))
+
+    for orig_idx, coro in store_tasks:
+        try:
+            results[orig_idx] = await coro
+        except Exception as exc:
+            logger.warning("[knowledge_store] store failed for item %d: %s", orig_idx, exc)
+
+    logger.info(
+        "[knowledge_store] batch stored %d/%d items",
+        sum(1 for r in results if r is not None), len(items),
+    )
+    return results
+
+
 async def search(
     query: str,
     limit: int = 8,
     source_filter: str | None = None,
     score_threshold: float = 0.35,
+    query_embedding: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Semantic search over the knowledge base.
 
     Args:
-        query:          Natural-language query.
-        limit:          Max results to return.
-        source_filter:  Filter by source ("email", "youtube", "rss", etc.).
+        query:           Natural-language query (embedded unless query_embedding given).
+        limit:           Max results to return.
+        source_filter:   Filter by source ("email", "youtube", "rss", etc.).
         score_threshold: Minimum similarity (0-1).
+        query_embedding: Pre-computed embedding vector; skips internal embed step.
+                         Used by HyDE to pass a hypothetical-document embedding.
 
     Returns:
         List of dicts with keys: content, score, source, metadata.
@@ -126,7 +190,7 @@ async def search(
     if not await _init():
         return []
     try:
-        embedding = await _embedder.generate_embedding(query)
+        embedding = query_embedding if query_embedding is not None else await _embedder.generate_embedding(query)
         filters = {"source": source_filter} if source_filter else None
         results = await _store.search_similar(
             query_embedding=embedding,

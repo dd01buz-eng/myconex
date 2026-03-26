@@ -383,24 +383,26 @@ class VectorStore:
         self._ensure_connected()
 
         try:
+            from qdrant_client.http.models import Filter, FieldCondition, MatchAny, Range
+
             cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
             types_to_clean = memory_types or ["context"]
 
-            # Delete points older than cutoff
-            delete_count = self.client.delete(
-                collection_name=self.collection_name,
-                points_selector={
-                    "filter": {
-                        "must": [
-                            {"key": "timestamp", "range": {"lt": cutoff_time}},
-                            {"key": "memory_type", "match": {"any": types_to_clean}},
-                        ]
-                    }
-                }
+            delete_filter = Filter(
+                must=[
+                    FieldCondition(key="timestamp", range=Range(lt=cutoff_time)),
+                    FieldCondition(key="memory_type", match=MatchAny(any=types_to_clean)),
+                ]
             )
-
-            logger.info(f"[vector_store] cleaned up {delete_count} old memories")
-            return delete_count
+            result = self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=delete_filter,
+            )
+            # qdrant delete returns an UpdateResult; deleted count is not always exposed
+            deleted = getattr(result, "result", None)
+            count = deleted if isinstance(deleted, int) else 0
+            logger.info("[vector_store] TTL cleanup: removed ~%d entries older than %dd", count, max_age_days)
+            return count
 
         except Exception as e:
             logger.error(f"[vector_store] cleanup failed: {e}")
@@ -408,46 +410,102 @@ class VectorStore:
 
     async def consolidate_memories(
         self,
-        agent_name: str,
-        similarity_threshold: float = 0.9,
+        agent_name: str = "buzlock",
+        similarity_threshold: float = 0.92,
+        page_size: int = 200,
     ) -> int:
         """
-        Consolidate similar memories to reduce redundancy.
+        Consolidate near-duplicate memories using vector similarity.
+
+        Strategy:
+          1. Page through entries sorted oldest-first.
+          2. For each entry, query for the nearest neighbour above
+             similarity_threshold in the same memory_type.
+          3. If a newer duplicate exists, mark the older one for deletion.
+          4. Delete all marked entries in one batch.
 
         Args:
-            agent_name: Agent whose memories to consolidate
-            similarity_threshold: Minimum similarity to consider duplicates
+            agent_name:           Agent namespace to consolidate.
+            similarity_threshold: Cosine similarity above which entries are
+                                  considered duplicates (default 0.92).
+            page_size:            Entries fetched per scroll page.
 
         Returns:
-            Number of memories consolidated
+            Number of entries removed.
         """
         self._ensure_connected()
 
         try:
-            # Get all agent memories
-            memories = await self.get_agent_memories(agent_name, limit=1000)
+            from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
-            if len(memories) < 2:
-                return 0
+            agent_filter = Filter(
+                must=[FieldCondition(key="agent_name", match=MatchValue(value=agent_name))]
+            )
 
-            # Simple consolidation: remove exact duplicates
-            seen_content = set()
-            to_delete = []
+            # Page through all entries with vectors
+            to_delete: List[str] = []
+            seen_ids: set = set()
+            offset = None
 
-            for memory in memories:
-                content_key = memory.content.lower().strip()
-                if content_key in seen_content:
-                    to_delete.append(memory.id)
-                else:
-                    seen_content.add(content_key)
+            while True:
+                scroll_kwargs: Dict[str, Any] = dict(
+                    collection_name=self.collection_name,
+                    scroll_filter=agent_filter,
+                    limit=page_size,
+                    with_vectors=True,
+                    with_payload=True,
+                )
+                if offset is not None:
+                    scroll_kwargs["offset"] = offset
+
+                points, next_offset = self.client.scroll(**scroll_kwargs)
+                if not points:
+                    break
+
+                for point in points:
+                    pid = str(point.id)
+                    if pid in seen_ids or pid in to_delete:
+                        continue
+                    if point.vector is None:
+                        continue
+
+                    # Find the nearest neighbour of this entry
+                    neighbours = self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=point.vector,
+                        query_filter=agent_filter,
+                        limit=2,          # top-2: first is self, second is nearest other
+                        score_threshold=similarity_threshold,
+                        with_payload=True,
+                    ).points
+
+                    for nb in neighbours:
+                        nb_id = str(nb.id)
+                        if nb_id == pid or nb_id in to_delete:
+                            continue
+                        # Keep the newer entry; delete the older one
+                        nb_ts = nb.payload.get("timestamp", 0) if nb.payload else 0
+                        pt_ts = point.payload.get("timestamp", 0) if point.payload else 0
+                        older_id = pid if pt_ts <= nb_ts else nb_id
+                        to_delete.append(older_id)
+                        seen_ids.add(older_id)
+
+                    seen_ids.add(pid)
+
+                if next_offset is None:
+                    break
+                offset = next_offset
 
             if to_delete:
                 self.client.delete(
                     collection_name=self.collection_name,
-                    points_selector={"points": to_delete}
+                    points_selector=to_delete,
                 )
 
-            logger.info(f"[vector_store] consolidated {len(to_delete)} duplicate memories")
+            logger.info(
+                "[vector_store] consolidation: removed %d near-duplicate entries (agent=%s threshold=%.2f)",
+                len(to_delete), agent_name, similarity_threshold,
+            )
             return len(to_delete)
 
         except Exception as e:
@@ -510,9 +568,26 @@ class EmbeddingClient:
             raise
 
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts."""
-        tasks = [self.generate_embedding(text) for text in texts]
-        return await asyncio.gather(*tasks)
+        """Generate embeddings for multiple texts in a single batch HTTP call."""
+        if not texts:
+            return []
+        try:
+            response = await self.client.post(
+                f"{self.ollama_url}/api/embed",
+                json={
+                    "model": self.model,
+                    "input": texts,
+                },
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            embs = data.get("embeddings") or data.get("embedding")
+            # Normalise: each element must be a flat list of floats
+            return [e if isinstance(e, list) else e for e in embs]
+        except Exception as e:
+            logger.error("[embedding] batch generate_embeddings failed: %s", e)
+            raise
 
     async def close(self):
         """Close the HTTP client."""

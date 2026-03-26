@@ -386,14 +386,26 @@ class RSSMonitor:
         batch = all_new[: self.batch_size]
 
         processed = 0
+        embed_queue: list[dict] = []
         for article in batch:
-            success = await self._process_article(article)
+            success, embed_item = await self._process_article(article)
             if success:
                 processed += 1
+                if embed_item:
+                    embed_queue.append(embed_item)
             seen.add(article["id"])
 
         if batch:
             _save_json(_SEEN_FILE, list(seen))
+
+        # Batch embed all queued wisdom texts in one Ollama call
+        if embed_queue:
+            try:
+                from integrations.knowledge_store import embed_and_store_batch
+                await embed_and_store_batch(embed_queue)
+                logger.info("[rss] batch-embedded %d article(s)", len(embed_queue))
+            except Exception as exc:
+                logger.debug("[rss] Qdrant batch embed skipped: %s", exc)
 
         if processed:
             try:
@@ -418,15 +430,19 @@ class RSSMonitor:
 
     # ── Single article ────────────────────────────────────────────────────────
 
-    async def _process_article(self, article: dict[str, Any]) -> bool:
-        """Process one article. Returns True if Fabric ran successfully."""
+    async def _process_article(self, article: dict[str, Any]) -> tuple[bool, dict | None]:
+        """Process one article.
+
+        Returns (success, embed_item) where embed_item is a dict ready for
+        embed_and_store_batch(), or None if there is nothing to embed.
+        """
         content = article.get("content", "")
         title   = article.get("title", "")[:80]
 
         if len(content) < _MIN_CONTENT_LEN:
             logger.debug("[rss] skipping short article (%d chars): %s", len(content), title)
             _save_insight_entry(article, {})
-            return False
+            return False, None
 
         logger.info("[rss] processing: %s  [%s]", title, article.get("feed_title", ""))
         fabric_result = await _fabric_process(content, title)
@@ -436,29 +452,24 @@ class RSSMonitor:
             _save_wisdom_entry(article, fabric_result)
             _update_profile_from_article(fabric_result, title, article.get("feed_title", ""))
 
-            # Embed into Qdrant knowledge base
             wisdom_text = (
                 fabric_result.get("raw", {}).get("extract_wisdom")
                 or fabric_result.get("raw", {}).get("summarize", "")
             )
+            embed_item = None
             if wisdom_text:
-                try:
-                    from integrations.knowledge_store import embed_and_store
-                    await embed_and_store(
-                        text=wisdom_text,
-                        source="rss",
-                        metadata={
-                            "title":      article.get("title", ""),
-                            "url":        article.get("url", ""),
-                            "feed_title": article.get("feed_title", ""),
-                            "published":  article.get("published", ""),
-                        },
-                    )
-                except Exception as exc:
-                    logger.debug("[rss] Qdrant embed skipped: %s", exc)
-
-            return True
-        return False
+                embed_item = {
+                    "text":   wisdom_text,
+                    "source": "rss",
+                    "metadata": {
+                        "title":      article.get("title", ""),
+                        "url":        article.get("url", ""),
+                        "feed_title": article.get("feed_title", ""),
+                        "published":  article.get("published", ""),
+                    },
+                }
+            return True, embed_item
+        return False, None
 
     # ── Summaries ─────────────────────────────────────────────────────────────
 
