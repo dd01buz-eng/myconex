@@ -1,0 +1,37 @@
+# MYCONEX — Runtime Dependencies
+# Generated from pyproject.toml [project.dependencies]
+#
+# Quick install:   pip install -r requirements.txt
+# Full install:    pip install -e .           (preferred — installs as editable package)
+# With extras:     pip install -e ".[dev]"    (+ linting/testing tools)
+#                  pip install -e ".[ai]"     (+ ollama, openai, sentence-transformers)
+#                  pip install -e ".[gpu]"    (+ gputil for GPU tier detection)
+#                  pip install -e ".[hermes-moe]"  (+ flash-moe / hermes-agent layer)
+
+# ─── Messaging & Service Mesh ─────────────────────────────────────────────────
+nats-py>=2.7.2
+zeroconf>=0.131.0
+
+# ─── Storage ──────────────────────────────────────────────────────────────────
+redis>=5.0.4
+qdrant-client>=1.9.1
+
+# ─── API & Web ────────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# ─── Data & Config ────────────────────────────────────────────────────────────
+pydantic>=2.7.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.1
+
+# ─── Integrations ─────────────────────────────────────────────────────────────
+discord.py>=2.7.0
+
+# ─── CLI & Utilities ──────────────────────────────────────────────────────────
+click>=8.1.7
+rich>=13.7.1
+psutil>=5.9.8
+loguru>=0.7.2

@@ -152,20 +152,27 @@ myconex/
 
 ### Prerequisites
 
-```bash
-python3 --version  # 3.10+
-
-# Optional — install for full feature set
-pip install PyYAML httpx pdfminer.six feedparser discord.py nats-py redis
-```
+- Python 3.10+
+- Docker (for hub services — NATS, Redis, Qdrant)
 
 ### Install
 
 ```bash
-git clone <repo>
+git clone https://github.com/dd01buz-eng/myconex.git
 cd myconex
-python3 -m venv venv && source venv/bin/activate
+python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# Runtime dependencies
 pip install -r requirements.txt
+
+# Or install as editable package (recommended for development)
+pip install -e .
+
+# With optional extras
+pip install -e ".[dev]"        # + pytest, ruff, mypy
+pip install -e ".[ai]"         # + ollama, openai, sentence-transformers
+pip install -e ".[gpu]"        # + gputil (GPU tier detection)
+pip install -e ".[hermes-moe]" # + flash-moe / hermes-agent layer
 ```
 
 ### Configure
@@ -476,7 +483,7 @@ python3 -m myconex --mode full
 ```bash
 git clone https://github.com/dd01buz-eng/myconex.git
 cd myconex
-python3 -m venv venv && source venv/bin/activate
+python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
