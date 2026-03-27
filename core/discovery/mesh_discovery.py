@@ -9,15 +9,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 logger = logging.getLogger(__name__)
+
+# ─── Service Discovery Types ───────────────────────────────────────────────────
+
+@dataclass
+class ServiceURLs:
+    """Resolved connection URLs for hub infrastructure services."""
+    nats_url:   Optional[str] = None   # e.g. "nats://192.168.1.100:4222"
+    redis_url:  Optional[str] = None   # e.g. "redis://192.168.1.100:6379"
+    qdrant_url: Optional[str] = None   # e.g. "http://192.168.1.100:6333"
+
+
+class ServiceDiscoveryError(RuntimeError):
+    """Raised when a required service cannot be resolved via mDNS or env vars."""
+    pass
+
 
 SERVICE_TYPE = "_ai-mesh._tcp.local."
 SERVICE_VERSION = "0.1.0"
@@ -89,6 +105,258 @@ class PeerRegistry:
 
     def get_sync(self, name: str) -> Optional[MeshPeer]:
         return self._peers.get(name)
+
+
+# ─── Port Parsing Helper ───────────────────────────────────────────────────────
+
+def _parse_port(url: str, default: int) -> int:
+    """Extract port from a URL string; return default if absent or unparseable."""
+    from urllib.parse import urlsplit
+    try:
+        port = urlsplit(url).port
+        return port if port is not None else default
+    except Exception:
+        return default
+
+
+# ─── Service Advertiser ────────────────────────────────────────────────────────
+
+_SERVICE_PORTS = {
+    "_nats._tcp.local.":   4222,
+    "_redis._tcp.local.":  6379,
+    "_qdrant._tcp.local.": 6333,
+}
+
+_SERVICE_URL_ATTRS = {
+    "_nats._tcp.local.":   "nats_url",
+    "_redis._tcp.local.":  "redis_url",
+    "_qdrant._tcp.local.": "qdrant_url",
+}
+
+
+class ServiceAdvertiser:
+    """
+    Probes localhost ports and registers mDNS records for running hub services.
+
+    Usage:
+        advertiser = ServiceAdvertiser(zc=discovery.zeroconf, node_name="hub", cfg=cfg)
+        await advertiser.start()
+        # ... node runs ...
+        await advertiser.stop()
+    """
+
+    def __init__(self, zc: "AsyncZeroconf", node_name: str, cfg: Any) -> None:
+        self._zc = zc
+        self._node_name = node_name
+        self._cfg = cfg
+        self._registered: list["AsyncServiceInfo"] = []
+
+    async def start(self) -> None:
+        """Probe all service ports concurrently; register mDNS for each found."""
+        nats_port   = _parse_port(self._cfg.mesh.nats_url,   4222)
+        redis_port  = _parse_port(self._cfg.mesh.redis_url,  6379)
+        qdrant_port = _parse_port(self._cfg.mesh.qdrant_url, 6333)
+
+        service_map = {
+            "_nats._tcp.local.":   nats_port,
+            "_redis._tcp.local.":  redis_port,
+            "_qdrant._tcp.local.": qdrant_port,
+        }
+
+        # Probe all ports concurrently
+        results = await asyncio.gather(
+            *[self._probe_port(port) for port in service_map.values()],
+            return_exceptions=True,
+        )
+
+        for (svc_type, port), result in zip(service_map.items(), results):
+            if result is True:
+                await self._register(svc_type, port)
+
+    async def stop(self) -> None:
+        """Unregister all advertised services."""
+        for info in self._registered:
+            try:
+                await self._zc.async_unregister_service(info)
+            except Exception:
+                pass
+        self._registered.clear()
+
+    async def _probe_port(self, port: int, timeout: float = 1.0) -> bool:
+        """Return True if something is listening on 127.0.0.1:port."""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=timeout,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    async def _register(self, svc_type: str, port: int) -> None:
+        instance_name = f"MYCONEX-{self._node_name}.{svc_type}"
+        addresses = [socket.inet_aton("127.0.0.1")]
+        try:
+            # Use our actual LAN IP for the advertisement
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                lan_ip = s.getsockname()[0]
+            addresses = [socket.inet_aton(lan_ip)]
+        except Exception:
+            pass
+
+        info = AsyncServiceInfo(
+            svc_type,
+            instance_name,
+            addresses=addresses,
+            port=port,
+            properties={
+                b"node": self._node_name.encode(),
+                b"version": SERVICE_VERSION.encode(),
+            },
+            server=f"{socket.gethostname()}.local.",
+        )
+        await self._zc.async_register_service(info, allow_name_change=True)
+        self._registered.append(info)
+        logger.info(f"[advertiser] registered {svc_type} on port {port}")
+
+
+# ─── Service Watcher ──────────────────────────────────────────────────────────
+
+_SVC_TYPE_TO_ATTR = {
+    "_nats._tcp.local.":   "nats_url",
+    "_redis._tcp.local.":  "redis_url",
+    "_qdrant._tcp.local.": "qdrant_url",
+}
+
+_SVC_TYPE_SCHEMES = {
+    "_nats._tcp.local.":   "nats",
+    "_redis._tcp.local.":  "redis",
+    "_qdrant._tcp.local.": "http",
+}
+
+
+class _ServiceBrowseListener:
+    """Internal Zeroconf listener that feeds discovered records into ServiceWatcher."""
+
+    def __init__(self, watcher: "ServiceWatcher") -> None:
+        self._watcher = watcher
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        """Return the event loop stored at start() time (from async context)."""
+        return self._loop  # always set by ServiceWatcher.start() before browsers run
+
+    def add_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._handle_add(zc, type_, name), self._get_loop()
+        )
+
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._handle_add(zc, type_, name), self._get_loop()
+        )
+
+    def remove_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        attr = _SVC_TYPE_TO_ATTR.get(type_)
+        if attr:
+            self._watcher._update_url(attr, None)
+
+    async def _handle_add(self, zc: Zeroconf, type_: str, name: str) -> None:
+        attr = _SVC_TYPE_TO_ATTR.get(type_)
+        if not attr:
+            return
+        try:
+            info = ServiceInfo(type_, name)
+            loop = asyncio.get_running_loop()
+            found = await loop.run_in_executor(None, lambda: info.request(zc, timeout=3000))
+            if not found:
+                return
+            addresses = info.parsed_addresses()
+            if not addresses:
+                return
+            scheme = _SVC_TYPE_SCHEMES.get(type_, "http")
+            url = f"{scheme}://{addresses[0]}:{info.port}"
+            self._watcher._update_url(attr, url)
+        except Exception as e:
+            logger.debug(f"[watcher] error resolving {name}: {e}")
+
+
+class ServiceWatcher:
+    """
+    Browses mDNS for hub services and maintains live ServiceURLs.
+    Stays alive after resolve_service_urls() for continuous reconnect support.
+
+    Usage:
+        watcher = ServiceWatcher(zc=discovery.zeroconf)
+        await watcher.start()
+        watcher.on_change(lambda urls: reconnect(urls))
+        urls = watcher.get_urls()
+        # ... later ...
+        await watcher.stop()
+    """
+
+    def __init__(self, zc: "AsyncZeroconf") -> None:
+        self._zc = zc
+        self._urls = ServiceURLs()
+        self._callbacks: list[Callable] = []
+        self._browsers: list = []
+
+    async def start(self) -> None:
+        """Begin browsing all three service types."""
+        listener = _ServiceBrowseListener(self)
+        listener._loop = asyncio.get_running_loop()  # capture loop from async context
+        for svc_type in _SVC_TYPE_TO_ATTR:
+            browser = AsyncServiceBrowser(
+                self._zc.zeroconf, svc_type, listener
+            )
+            self._browsers.append(browser)
+        logger.info("[watcher] service discovery started")
+
+    async def stop(self) -> None:
+        """Stop all browsers and cancel their background tasks."""
+        for browser in self._browsers:
+            try:
+                await browser.async_cancel()
+            except Exception:
+                pass
+        self._browsers.clear()
+        logger.info("[watcher] service discovery stopped")
+
+    def get_urls(self) -> ServiceURLs:
+        """Return a snapshot of currently resolved service URLs."""
+        return ServiceURLs(
+            nats_url=self._urls.nats_url,
+            redis_url=self._urls.redis_url,
+            qdrant_url=self._urls.qdrant_url,
+        )
+
+    def on_change(self, callback: Callable[["ServiceURLs"], None]) -> None:
+        """Register a callback (sync or coroutine) fired on any URL change."""
+        self._callbacks.append(callback)
+
+    def _update_url(self, attr: str, value: Optional[str]) -> None:
+        """Update a URL field and fire all registered callbacks."""
+        setattr(self._urls, attr, value)
+        snapshot = self.get_urls()
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+        for cb in self._callbacks:
+            result = cb(snapshot)
+            if asyncio.iscoroutine(result):
+                if loop:
+                    asyncio.ensure_future(result, loop=loop)
+                else:
+                    asyncio.run(result)
 
 
 # ─── Service Listener ─────────────────────────────────────────────────────────
@@ -291,6 +559,13 @@ class MeshDiscovery:
     def service_name(self) -> str:
         return f"MYCONEX-{self.node_name}"
 
+    @property
+    def zeroconf(self) -> "AsyncZeroconf":
+        """Return the running AsyncZeroconf instance (raises if not started)."""
+        if self._zeroconf is None:
+            raise RuntimeError("MeshDiscovery not started — call start() first")
+        return self._zeroconf
+
     def _get_local_addresses(self) -> list[str]:
         addrs = []
         try:
@@ -327,6 +602,62 @@ class MeshDiscovery:
                 return True
             await asyncio.sleep(1.0)
         return False
+
+
+# ─── Public API ───────────────────────────────────────────────────────────────
+
+async def resolve_service_urls(
+    zc: "AsyncZeroconf",
+    cfg: Any,
+    timeout: float = 10.0,
+) -> tuple[ServiceURLs, "ServiceWatcher"]:
+    """
+    Resolve hub service URLs via mDNS discovery with env var priority.
+
+    Priority per service (independently):
+      1. Explicit user config: env var or .env file value (highest priority)
+      2. mDNS discovery (waits up to timeout seconds)
+      3. ServiceDiscoveryError (fail fast with diagnostic message)
+
+    Returns:
+        (ServiceURLs, ServiceWatcher) — URLs and the live watcher (keep for reconnect)
+
+    Raises:
+        ServiceDiscoveryError — if any service has no URL from either source
+    """
+    watcher = ServiceWatcher(zc=zc)
+    await watcher.start()
+
+    # Wait for mDNS results
+    await asyncio.sleep(timeout)
+    discovered = watcher.get_urls()
+
+    def _resolve(env_key: str, mdns_url: Optional[str], label: str) -> str:
+        # Priority 1: explicit user config (env var or .env, both land in os.environ)
+        if (v := os.environ.get(env_key)):
+            logger.info(f"[discovery] {label}: using explicit config ({env_key}={v})")
+            return v
+        # Priority 2: mDNS
+        if mdns_url:
+            logger.info(f"[discovery] {label}: resolved via mDNS → {mdns_url}")
+            return mdns_url
+        # Priority 3: fail
+        raise ServiceDiscoveryError(
+            f"Could not resolve {label}.\n"
+            f"  Tried: mDNS (_{label.lower()}._tcp.local.) — not found after {timeout:.0f}s\n"
+            f"  Tried: {env_key} env var — not set by user\n"
+            f"  Fix: start the hub first, or set {env_key} in .env"
+        )
+
+    nats_url   = _resolve("NATS_URL",   discovered.nats_url,   "NATS")
+    redis_url  = _resolve("REDIS_URL",  discovered.redis_url,  "Redis")
+    qdrant_url = _resolve("QDRANT_URL", discovered.qdrant_url, "Qdrant")
+
+    return ServiceURLs(
+        nats_url=nats_url,
+        redis_url=redis_url,
+        qdrant_url=qdrant_url,
+    ), watcher
 
 
 # ─── CLI / standalone ─────────────────────────────────────────────────────────

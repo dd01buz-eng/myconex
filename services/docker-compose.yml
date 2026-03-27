@@ -1,4 +1,4 @@
-version: "3.9"
+name: myconex-hub
 
 # MYCONEX Service Stack
 # Core infrastructure: NATS, Redis, Qdrant, Ollama, LiteLLM
@@ -15,7 +15,6 @@ volumes:
   qdrant_data:
   ollama_data:
   nats_data:
-  litellm_data:
 
 services:
 
@@ -93,7 +92,7 @@ services:
       myconex:
         ipv4_address: 172.30.0.12
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/6333"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -127,7 +126,7 @@ services:
       myconex:
         ipv4_address: 172.30.0.13
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 15s
       retries: 5
@@ -146,11 +145,10 @@ services:
       - "4000:4000"
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
-      - litellm_data:/app/data
     environment:
       - LITELLM_LOG=INFO
       - REDIS_URL=redis://redis:6379
-      - DATABASE_URL=sqlite:////app/data/litellm.db
+      - DISABLE_SCHEMA_UPDATE=true
     depends_on:
       ollama:
         condition: service_healthy
@@ -160,7 +158,7 @@ services:
       myconex:
         ipv4_address: 172.30.0.14
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]
       interval: 20s
       timeout: 10s
       retries: 5
@@ -168,6 +166,8 @@ services:
     labels:
       com.myconex.service: "litellm"
       com.myconex.role: "llm-proxy"
+    profiles:
+      - full   # Requires PostgreSQL. Start with: docker compose --profile full up
 
   # ─── MYCONEX API Gateway ──────────────────────────────────────────────────────
   api:

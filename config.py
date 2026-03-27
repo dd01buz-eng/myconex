@@ -390,6 +390,22 @@ def _apply_yaml(cfg: MyconexConfig, data: dict) -> None:
         cfg.memory.namespace = r.get("memory_namespace", cfg.memory.namespace)
 
 
+def apply_discovered_urls(cfg: "MyconexConfig", urls: "ServiceURLs") -> None:
+    """
+    Apply mDNS-discovered service URLs to cfg.mesh in-place.
+
+    Only applies a URL when:
+      - The ServiceURLs field is not None (service was found)
+      - No explicit user env var is set for that service (user config wins)
+    """
+    if urls.nats_url and not os.environ.get("NATS_URL"):
+        cfg.mesh.nats_url = urls.nats_url
+    if urls.redis_url and not os.environ.get("REDIS_URL"):
+        cfg.mesh.redis_url = urls.redis_url
+    if urls.qdrant_url and not os.environ.get("QDRANT_URL"):
+        cfg.mesh.qdrant_url = urls.qdrant_url
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def load_config(
